@@ -15,6 +15,10 @@
 5. **冻结宽限** —— 计数器冻结但 `stall_sec` 内出过词 → 容忍大 prefill 批。
 6. **启动豁免** —— 还没成功拉到过 `/metrics` 前一律健康(交给 startupProbe 兜模型加载)。
 
+### 与 monitor 的行为差异(有意为之)
+- **不做主动小流量探测**:monitor 判活末环是「停滞超 grace → 主动打 `/v1/completions` 确认」;本 sidecar 纯被动,用「停滞 `stall_sec` + `running>0`」代替(免鉴权、不加载)。取舍:若引擎 hang 但 `num_running_reqs` 本身也僵在 0,会判空闲而漏杀 —— 概率极低(有在途请求还持续不出一个 token≈真死),接受。
+- **engine liveness 现耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
+
 ## 配置(env + ConfigMap 热加载)
 | 来源 | 项 | 默认 | 说明 |
 |---|---|---|---|

@@ -88,7 +88,7 @@ func main() {
 	// /healthz:engine 的 livenessProbe 探这里。健康 200 / hang 503。
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
-		hung, reason := w.Hung()
+		hung, _, reason := w.Hung()
 		if hung {
 			rw.WriteHeader(http.StatusServiceUnavailable) // 503 → engine liveness 失败 → kubelet 重启
 			_, _ = io.WriteString(rw, "hung: "+reason)
@@ -108,9 +108,13 @@ func main() {
 	defer stop()
 
 	client := &http.Client{}
-	var lastReason string
-	var lastMtime time.Time
+	var lastState string
 	hot := loadHot(configFile, defaults)
+	var lastMtime time.Time
+	if fi, err := os.Stat(configFile); err == nil {
+		lastMtime = fi.ModTime() // 预置:首轮不再冗余重读,「热更」日志只在真改动时出
+	}
+	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec)
 
 	for {
 		// 热加载配置(仅 mtime 变时重读 + 打日志)
@@ -127,8 +131,8 @@ func main() {
 		}
 		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second)
 
-		if hung, reason := w.Hung(); reason != lastReason { // 裁决变化才打日志(避免刷屏)
-			lastReason = reason
+		if hung, state, reason := w.Hung(); state != lastState { // 粗状态变化才打日志(reason 内数字每轮变,按 state 去重免刷屏)
+			lastState = state
 			if hung {
 				log.Printf("HANG 判定 → /healthz 返 503:%s", reason)
 			} else {
