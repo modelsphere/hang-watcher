@@ -142,12 +142,36 @@ func TestActiveProbe(t *testing.T) {
 		t.Errorf("主动探测失败应判 hang")
 	}
 
-	// 探测只在 stall-hang 分支触发:出词增长(健康)时不应调用
+	// 探测只在冻结超 grace 时触发:出词增长(健康)时不应调用
 	called := false
 	wGrow := newWatcher()
 	wGrow.step(t0, snap(1000, 2), nil, stall, nil)
 	wGrow.step(t0.Add(15*time.Second), snap(2000, 2), nil, stall, func() bool { called = true; return false })
 	if called {
 		t.Errorf("出词增长(健康)不应触发主动探测")
+	}
+
+	// 缺口修复:探测开 + running==0 + 冻结超 stall + 探测失败 → 判 hang(wedged-idle,scheduler 卡死)
+	wIdleBad := newWatcher()
+	wIdleBad.step(t0, snap(1000, 0), nil, stall, nil)
+	wIdleBad.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return false })
+	if h, _, _ := wIdleBad.Hung(); !h {
+		t.Errorf("running==0 但冻结超 stall + 探测失败(wedged-idle)应判 hang")
+	}
+
+	// 探测开 + running==0 + 探测成功 → 健康(真空闲,不误杀)
+	wIdleOK := newWatcher()
+	wIdleOK.step(t0, snap(1000, 0), nil, stall, nil)
+	wIdleOK.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return true })
+	if h, _, _ := wIdleOK.Hung(); h {
+		t.Errorf("running==0 且探测成功(真空闲)不应判 hang")
+	}
+
+	// 被动(probe=nil)+ running==0 + 冻结超 stall → 仍判空闲(不改被动行为)
+	wPassive := newWatcher()
+	wPassive.step(t0, snap(1000, 0), nil, stall, nil)
+	wPassive.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, nil)
+	if h, _, _ := wPassive.Hung(); h {
+		t.Errorf("被动模式 running==0 冻结应仍判空闲(分不清 wedged/空闲)")
 	}
 }

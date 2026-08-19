@@ -157,20 +157,25 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		w.set(false, "freeze-grace", "计数器冻结但 "+dur(now.Sub(w.lastGrow))+" 前出过词(<stall,视为在干活)")
 		return
 	}
-	if m.running > 0 {
-		stalled := dur(now.Sub(w.lastGrow))
-		if probe != nil {
-			if probe() {
-				w.set(false, "stall-active-ok", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+",但主动探测存活 → 不判 hang")
-				return
-			}
-			w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0,主动探测失败 → hang")
+	stalled := dur(now.Sub(w.lastGrow))
+	// 冻结超 grace。开了主动探测:无论 running 与否都主动打一下确认 —— 这能抓到 scheduler
+	// 卡死这类「看着空闲(running=0/queue=0)」的 hang(纯被动从指标分不清 wedged 与真空闲)。
+	// 探测本身生成 1 个 token → 健康引擎下轮即 growing、停滞计时自动重置,故对真空闲引擎约每
+	// stall_sec 才探一次,不会每轮骚扰。
+	if probe != nil {
+		if probe() {
+			w.set(false, "stall-active-ok", "token 停滞 "+stalled+"(running="+ftoa(m.running)+"),主动探测存活 → 不判 hang")
 			return
 		}
-		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang")
+		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测失败(running="+ftoa(m.running)+")→ hang")
 		return
 	}
-	w.set(false, "idle", "空闲(running=0,停滞不算 hang)")
+	// 纯被动(未开主动探测):只有在途请求还卡着才敢判 hang;running==0 分不清 wedged/空闲 → 放过。
+	if m.running > 0 {
+		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang(被动)")
+		return
+	}
+	w.set(false, "idle", "空闲(running=0,停滞不算 hang;开 active_probe 可覆盖 wedged-idle)")
 }
 
 func dur(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) + "s" }

@@ -16,15 +16,16 @@
 6. **启动豁免** —— 还没成功拉到过 `/metrics` 前一律健康(交给 startupProbe 兜模型加载)。
 
 ### 可选:主动探测确认(`active_probe_enabled`,默认关)
-第 3 条「停滞 + running>0」是被动判定,可能误杀(引擎慢但活着)。开启主动探测后,**将判 stall-hang 时先主动打一下引擎**(如 `GET /health_generate`,sglang;vllm 可配 `POST /v1/completions`)确认:
-- 探测 **2xx(通)** → 引擎仍能响应 → **不判 hang**(state=`stall-active-ok`),避免误杀;
-- 探测 **失败/超时** → 坐实 hang → 503。
+纯被动的第 3/4 条(停滞 + running)有两个盲区:① running>0 停滞可能误杀(引擎慢但活着);② **scheduler 卡死时请求只堆在 tokenizer→scheduler 的 IPC 里,`num_running_reqs=0` 且 `num_queue_reqs=0`,从指标看跟真空闲一样 → 被判空闲、漏杀**(实测 SIGSTOP sglang scheduler 复现)。
 
-这补齐了与 monitor 的最后一层对齐(monitor 末环就是主动 `/v1/completions` 确认)。**只在 stall-hang 分支触发**(空闲/出词/不可达都不打),不额外加载;默认关时行为与之前完全一致(纯被动)。
+开启主动探测后,**只要「token 冻结超 `stall_sec`(超 grace)」就主动打一下引擎**(`POST /v1/completions`,body 由 chart 按 `model.name` 生成),**不再要求 running>0**:
+- 探测 **2xx(通)** → 引擎仍能生成 → **不判 hang**(state=`stall-active-ok`),避免误杀;
+- 探测 **失败/超时(`active_probe_timeout_sec`)** → 坐实 hang → 503。
+
+这样既保留原「running>0 停滞」的确认,又补上 **wedged-idle(running=0)** 盲区,完全对齐 monitor(末环就是冻结超 grace → 主动 `/v1/completions` 确认)。**触发大前提仍是「token 冻结超 grace」**——出词/宽限内/不可达都不打,健康引擎不受骚扰;且探测本身生成 1 token → 健康引擎下轮即 growing、停滞计时重置,故真空闲引擎约每 `stall_sec` 才探一次。默认关时行为与之前完全一致(纯被动:running==0 冻结仍判空闲)。
 
 ### 与 monitor 的行为差异
 - **engine liveness 耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
-- **engine liveness 现耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
 
 ## 配置(env + ConfigMap 热加载)
 | 来源 | 项 | 默认 | 说明 |
