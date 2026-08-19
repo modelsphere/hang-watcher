@@ -111,7 +111,11 @@ func (w *watcher) Hung() (bool, string, string) {
 
 // step:处理一轮 poll 结果。fetchErr!=nil 表示 /metrics 拉不到。stall 是停滞判 hang 的阈值。
 // 未 started(启动期,还没成功拉到过 metrics)→ 一律健康,交给 startupProbe 兜启动。
-func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.Duration) {
+//
+// probe 是【可选】的主动探测(nil=关):仅在被动逻辑将判 stall-hang 时调用 —— 主动打一下引擎
+// (如 GET /health_generate),通了就认为引擎仍存活、不判 hang(对齐 monitor 的『杀前确认』,减少
+// running>0 停滞的误杀);打不通才坐实 hang。其它分支(空闲/不可达/出词)不触发,不额外加载。
+func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.Duration, probe func() bool) {
 	if fetchErr != nil {
 		if !w.started {
 			w.set(false, "startup", "启动中:/metrics 暂不可达(startupProbe 兜)")
@@ -154,7 +158,16 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		return
 	}
 	if m.running > 0 {
-		w.set(true, "stall-hang", "token 停滞 "+dur(now.Sub(w.lastGrow))+" 且 running="+ftoa(m.running)+">0 → hang")
+		stalled := dur(now.Sub(w.lastGrow))
+		if probe != nil {
+			if probe() {
+				w.set(false, "stall-active-ok", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+",但主动探测存活 → 不判 hang")
+				return
+			}
+			w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0,主动探测失败 → hang")
+			return
+		}
+		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang")
 		return
 	}
 	w.set(false, "idle", "空闲(running=0,停滞不算 hang)")

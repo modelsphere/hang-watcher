@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -41,13 +42,24 @@ type hotConfig struct {
 	PollIntervalSec   int `json:"poll_interval_sec"`
 	StallSec          int `json:"stall_sec"`           // token 停滞多久(且 running>0)判 hang;对齐 monitor GRACE=180
 	MetricsTimeoutSec int `json:"metrics_timeout_sec"` // 拉 /metrics 超时
+
+	// 主动探测(可选,默认关):疑似 stall-hang 时主动打一下引擎确认,通了不判 hang(减少误杀)。
+	ActiveProbeEnabled    bool   `json:"active_probe_enabled"`
+	ActiveProbePath       string `json:"active_probe_path"`        // 如 /health_generate(sglang);vllm 可用 POST /v1/completions
+	ActiveProbeMethod     string `json:"active_probe_method"`      // GET / POST
+	ActiveProbeBody       string `json:"active_probe_body"`        // POST 时的请求体(如 completions JSON);GET 留空
+	ActiveProbeTimeoutSec int    `json:"active_probe_timeout_sec"` // 主动探测超时(生成可能比抓 metrics 慢)
 }
 
 func defaultHot() hotConfig {
 	return hotConfig{
-		PollIntervalSec:   envInt("POLL_INTERVAL_SEC", 15),
-		StallSec:          envInt("STALL_SEC", 180),
-		MetricsTimeoutSec: envInt("METRICS_TIMEOUT_SEC", 10),
+		PollIntervalSec:       envInt("POLL_INTERVAL_SEC", 15),
+		StallSec:              envInt("STALL_SEC", 180),
+		MetricsTimeoutSec:     envInt("METRICS_TIMEOUT_SEC", 10),
+		ActiveProbeEnabled:    false,
+		ActiveProbePath:       "/health_generate",
+		ActiveProbeMethod:     "GET",
+		ActiveProbeTimeoutSec: 20,
 	}
 }
 
@@ -71,7 +83,54 @@ func loadHot(path string, base hotConfig) hotConfig {
 	if cur.MetricsTimeoutSec <= 0 {
 		cur.MetricsTimeoutSec = base.MetricsTimeoutSec
 	}
+	if cur.ActiveProbePath == "" {
+		cur.ActiveProbePath = base.ActiveProbePath
+	}
+	if cur.ActiveProbeMethod == "" {
+		cur.ActiveProbeMethod = base.ActiveProbeMethod
+	}
+	if cur.ActiveProbeTimeoutSec <= 0 {
+		cur.ActiveProbeTimeoutSec = base.ActiveProbeTimeoutSec
+	}
 	return cur
+}
+
+// activeProbe:按 hot 配置构造主动探测闭包(未开启返回 nil,step 里即不探)。
+// 打一个 HTTP 请求(GET/POST path,带 body),2xx 视为引擎存活(true)。
+func makeActiveProbe(client *http.Client, base string, hot hotConfig) func() bool {
+	if !hot.ActiveProbeEnabled {
+		return nil
+	}
+	return func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(hot.ActiveProbeTimeoutSec)*time.Second)
+		defer cancel()
+		var body io.Reader
+		if hot.ActiveProbeBody != "" {
+			body = strings.NewReader(hot.ActiveProbeBody)
+		}
+		req, err := http.NewRequestWithContext(ctx, hot.ActiveProbeMethod, base+hot.ActiveProbePath, body)
+		if err != nil {
+			return false
+		}
+		if hot.ActiveProbeBody != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false // 超时/连不上 = 探测失败 → 坐实 hang
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return resp.StatusCode >= 200 && resp.StatusCode < 300
+	}
+}
+
+// probeDesc:主动探测配置的一行日志描述。
+func probeDesc(h hotConfig) string {
+	if !h.ActiveProbeEnabled {
+		return "off"
+	}
+	return h.ActiveProbeMethod + " " + h.ActiveProbePath + "(超时" + strconv.Itoa(h.ActiveProbeTimeoutSec) + "s)"
 }
 
 func main() {
@@ -114,14 +173,14 @@ func main() {
 	if fi, err := os.Stat(configFile); err == nil {
 		lastMtime = fi.ModTime() // 预置:首轮不再冗余重读,「热更」日志只在真改动时出
 	}
-	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec)
+	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds 主动探测=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot))
 
 	for {
 		// 热加载配置(仅 mtime 变时重读 + 打日志)
 		if fi, err := os.Stat(configFile); err == nil && fi.ModTime() != lastMtime {
 			lastMtime = fi.ModTime()
 			hot = loadHot(configFile, defaults)
-			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec)
+			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds 主动探测=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot))
 		}
 
 		text, err := fetchMetrics(client, engineURL, time.Duration(hot.MetricsTimeoutSec)*time.Second)
@@ -129,7 +188,7 @@ func main() {
 		if err == nil {
 			snap = parseMetrics(text)
 		}
-		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second)
+		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second, makeActiveProbe(client, engineURL, hot))
 
 		if hung, state, reason := w.Hung(); state != lastState { // 粗状态变化才打日志(reason 内数字每轮变,按 state 去重免刷屏)
 			lastState = state

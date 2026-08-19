@@ -15,8 +15,15 @@
 5. **冻结宽限** —— 计数器冻结但 `stall_sec` 内出过词 → 容忍大 prefill 批。
 6. **启动豁免** —— 还没成功拉到过 `/metrics` 前一律健康(交给 startupProbe 兜模型加载)。
 
-### 与 monitor 的行为差异(有意为之)
-- **不做主动小流量探测**:monitor 判活末环是「停滞超 grace → 主动打 `/v1/completions` 确认」;本 sidecar 纯被动,用「停滞 `stall_sec` + `running>0`」代替(免鉴权、不加载)。取舍:若引擎 hang 但 `num_running_reqs` 本身也僵在 0,会判空闲而漏杀 —— 概率极低(有在途请求还持续不出一个 token≈真死),接受。
+### 可选:主动探测确认(`active_probe_enabled`,默认关)
+第 3 条「停滞 + running>0」是被动判定,可能误杀(引擎慢但活着)。开启主动探测后,**将判 stall-hang 时先主动打一下引擎**(如 `GET /health_generate`,sglang;vllm 可配 `POST /v1/completions`)确认:
+- 探测 **2xx(通)** → 引擎仍能响应 → **不判 hang**(state=`stall-active-ok`),避免误杀;
+- 探测 **失败/超时** → 坐实 hang → 503。
+
+这补齐了与 monitor 的最后一层对齐(monitor 末环就是主动 `/v1/completions` 确认)。**只在 stall-hang 分支触发**(空闲/出词/不可达都不打),不额外加载;默认关时行为与之前完全一致(纯被动)。
+
+### 与 monitor 的行为差异
+- **engine liveness 耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
 - **engine liveness 现耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
 
 ## 配置(env + ConfigMap 热加载)
@@ -28,6 +35,11 @@
 | **ConfigMap(热更)** | `poll_interval_sec` | 15 | 拉 /metrics 周期 |
 | **ConfigMap(热更)** | `stall_sec` | 180 | 停滞判 hang 阈值(对齐 monitor GRACE) |
 | **ConfigMap(热更)** | `metrics_timeout_sec` | 10 | /metrics 超时 |
+| **ConfigMap(热更)** | `active_probe_enabled` | `false` | 开启「判 hang 前主动探测确认」 |
+| **ConfigMap(热更)** | `active_probe_path` | `/health_generate` | 探测路径(vllm 可用 `/v1/completions`) |
+| **ConfigMap(热更)** | `active_probe_method` | `GET` | `GET` / `POST` |
+| **ConfigMap(热更)** | `active_probe_body` | `""` | POST 请求体(如 completions JSON);GET 留空 |
+| **ConfigMap(热更)** | `active_probe_timeout_sec` | 20 | 主动探测超时(生成可能慢于抓 metrics) |
 
 **调参 = 改 ConfigMap `kubectl apply`,sidecar 下轮读到,不用滚 pod**(mtime 变才重读)。只有改 sidecar **代码/镜像**才滚 pod。
 
