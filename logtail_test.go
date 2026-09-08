@@ -85,6 +85,48 @@ func TestLogTailer(t *testing.T) {
 	}
 }
 
+// pattern 的三条路径:空(用内置默认)/ 自定义 / 非法正则。
+// chart 里 logHang.pattern 留空时模板不下发 LOG_HANG_PATTERN,走的就是第一条。
+func TestLogTailerPattern(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.log")
+	writeLines(t, p, "seed")
+
+	// ① 空 pattern -> 内置 detokenizer 正则(chart 默认 logHang.pattern: "")
+	def, err := newLogTailer(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer def.close()
+	if def.pattern.String() != defaultLogHangPattern {
+		t.Errorf("空 pattern 应回落到内置默认,实际 %q", def.pattern.String())
+	}
+	def.poll() // 建立偏移
+	writeLines(t, p, sampleHang, "EngineCore encountered a fatal error")
+	if h, _ := def.poll(); h != 1 {
+		t.Errorf("内置默认只应命中 detokenizer 那行(1),实际 %d", h)
+	}
+
+	// ② 自定义 pattern(vllm 场景:换成 EngineCore 的特征行)
+	p2 := filepath.Join(dir, "b.log")
+	writeLines(t, p2, "seed")
+	cus, err := newLogTailer(p2, `EngineCore encountered a fatal error`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cus.close()
+	cus.poll()
+	writeLines(t, p2, sampleHang, "ERROR EngineCore encountered a fatal error")
+	if h, _ := cus.poll(); h != 1 {
+		t.Errorf("自定义 pattern 应只命中 EngineCore 那行(1),实际 %d", h)
+	}
+
+	// ③ 非法正则 -> 报错(main.go 据此打日志并退回纯 progress 判定,不 crash)
+	if _, err := newLogTailer(p, "("); err == nil {
+		t.Errorf("非法正则应返回 err")
+	}
+}
+
 func TestLogTailerMissing(t *testing.T) {
 	tl, _ := newLogTailer(filepath.Join(t.TempDir(), "nope-*.log"), "")
 	defer tl.close()
