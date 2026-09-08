@@ -235,7 +235,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang(被动)")
 		return
 	}
-	w.set(false, "idle", "空闲(running=0,停滞不算 hang;开 active_probe 可覆盖 wedged-idle)")
+	w.set(false, "idle", "空闲(running=0,停滞不算 hang;wedged-idle 靠日志快判或 active_probe 覆盖)")
 }
 
 func dur(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) + "s" }
