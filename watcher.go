@@ -3,9 +3,13 @@
 // 复刻 monitor lib/checks.py 的判活优先级(被动短路,不主动打流量):
 //  1. /metrics 可达性  —— 拉不到(引擎 HTTP 层死)= 疑 hang
 //  2. token_progress 涨 —— 本轮比上轮多出词/prefill → 在干活,健康
+//     (sglang 靠 realtime_tokens_total 提供 iteration 级信号,
+//     *_tokens_total 是请求结束才累加的,单独用会误杀长请求)
 //  3. 停滞 + running>0   —— 计数器不涨、却有在途请求 → 真 hang
 //  4. 空闲豁免           —— 停滞但 running==0 → 空闲,健康(不误杀半夜无流量)
 //  5. 冻结宽限           —— 计数器冻结但 GRACE 秒内出过词 → 容忍大 prefill 批
+//  6. 日志快判(可选)   —— 停滞 log_stall_sec(默认 30,短于 stall_sec)+ 引擎日志最近喊过
+//     hang 特征行 → 两个独立信号叠加,提前判 hang、缩短重启时间
 //
 // 本文件只做「一次 poll 结果 → 更新裁决」的纯状态机 + /metrics 文本解析,便于单测。
 // HTTP 服务 + poll 循环 + 配置热更在 main.go。
@@ -18,12 +22,28 @@ import (
 	"time"
 )
 
-// token_progress = 这几个 counter 求和(跨 DP 多系列)。与 monitor _PROGRESS_METRICS 一致。
+// token_progress = 这几个 counter 求和(跨 DP 多系列)。
+//
+// ⚠️ 2026-09-08:必须包含 sglang:realtime_tokens_total,否则长请求会被误判 hang。
+// sglang 的 generation_tokens_total / prompt_tokens_total 只在【请求结束】时一次性累加
+// (tokenizer_manager.py → observe_one_finished_request → generation_tokens_total.inc()),
+// 一条请求从 prefill、decode 到尾部 tool-call parser 的【整个生命周期内它们都不动】。
+// 低并发场景(半夜 / 单实例)跑一条 200s+ 的深推理请求时,没有别的请求完成把计数器顶上去 →
+// token_progress 冻结超过 stall_sec 且 running>0 → 命中「停滞+running>0=真 hang」
+// → 把一台正在正常干活的实例杀掉。生产至今没爆只是因为并发高、总有请求在完成。
+//
+// realtime_tokens_total 是 iteration 级的:metrics_reporter.py 每个 forward 都 inc
+// (decode 加 batch_size、prefill 加 log_input_tokens/log_hit_tokens,带 mode label 三分),
+// 注释原文 "Every-iteration work: realtime token counting" —— 这才是真正的实时进度信号。
+// 空闲时没有 forward、不会自增,所以不会把 idle 误判成「在干活」。
+// vllm 侧的 generation_tokens_total 本身就是按 step 累加的,不受此问题影响,无需对应项。
+// 旧版 sglang 没有这个 counter,自动退化回原来的四项。
 var progressMetrics = map[string]bool{
 	"vllm:generation_tokens_total":   true,
 	"vllm:prompt_tokens_total":       true,
 	"sglang:generation_tokens_total": true,
 	"sglang:prompt_tokens_total":     true,
+	"sglang:realtime_tokens_total":   true,
 }
 
 // metricsSnap:一轮 /metrics 解析结果。
@@ -90,6 +110,32 @@ type watcher struct {
 	lastGrow     time.Time // 上次 token_progress 真增长时刻
 	started      bool      // 拿到过一次成功 /metrics(启动期豁免:未 started 一律健康)
 	firstFail    time.Time // 引擎连续无响应起点(零值=当前可达)
+
+	// 日志二次确认(可选,log_file 配了才启用)。见 logtail.go 的说明。
+	logEnabled bool          // 配了日志通道
+	logWindow  time.Duration // 特征行「算数」的时效窗
+	logStall   time.Duration // 有日志佐证时的【短】停滞阈值(远小于 stall_sec)
+	lastLogHit time.Time     // 最近一次匹配到特征行的时刻
+	logBroken  bool          // 日志读不了(文件缺失/权限)→ 退回纯 progress 判定,不因此漏杀
+}
+
+// enableLogConfirm:开启日志快判。停滞 >= logStall 且 window 内出现过特征行 → 直接判 hang。
+// 与原 stall_sec 路径是【或】关系:日志没喊仍按 stall_sec 判,检测能力只增不减。
+func (w *watcher) enableLogConfirm(logStall, window time.Duration) {
+	w.mu.Lock()
+	w.logEnabled, w.logStall, w.logWindow = true, logStall, window
+	w.mu.Unlock()
+}
+
+// noteLogHits:每轮 poll 后把 tail 结果喂进来。hits>0 刷新「最近命中时刻」;
+// err!=nil 表示日志通道不可用 —— 标记 broken,判定退回纯 progress(宁可误杀也不漏杀)。
+func (w *watcher) noteLogHits(now time.Time, hits int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.logBroken = err != nil
+	if hits > 0 {
+		w.lastLogHit = now
+	}
 }
 
 func newWatcher() *watcher {
@@ -153,11 +199,25 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		return
 	}
 	// m.tp == lastTP:停滞
-	if now.Sub(w.lastGrow) < stall {
-		w.set(false, "freeze-grace", "计数器冻结但 "+dur(now.Sub(w.lastGrow))+" 前出过词(<stall,视为在干活)")
+	//
+	// 【快路径】日志二次确认:两个独立信号同时成立时,不必等满 stall_sec。
+	// 纯 progress 判定要等满 stall_sec,是因为单一信号不敢下手(大 prefill 批、低并发长请求都会
+	// 让计数器冻结)。而引擎自己喊 detokenizer 超时是另一个独立证据 —— 两者叠加时置信度足够,
+	// 用短得多的 log_stall_sec(默认 30s)就能判,进一步缩短重启时间。
+	// 不影响原路径:日志没喊 / 通道坏了,仍按 stall_sec 走下面的老逻辑,只增不减。
+	stalledFor := now.Sub(w.lastGrow)
+	if w.logEnabled && !w.logBroken && stalledFor >= w.logStall &&
+		!w.lastLogHit.IsZero() && now.Sub(w.lastLogHit) <= w.logWindow {
+		w.set(true, "stall-hang-log", "token 停滞 "+dur(stalledFor)+"(>=log_stall "+dur(w.logStall)+
+			",running="+ftoa(m.running)+")且 "+dur(now.Sub(w.lastLogHit))+
+			" 前引擎日志报 hang 特征 → hang(双信号快判)")
 		return
 	}
-	stalled := dur(now.Sub(w.lastGrow))
+	if stalledFor < stall {
+		w.set(false, "freeze-grace", "计数器冻结但 "+dur(stalledFor)+" 前出过词(<stall,视为在干活)")
+		return
+	}
+	stalled := dur(stalledFor)
 	// 冻结超 grace。开了主动探测:无论 running 与否都主动打一下确认 —— 这能抓到 scheduler
 	// 卡死这类「看着空闲(running=0/queue=0)」的 hang(纯被动从指标分不清 wedged 与真空闲)。
 	// 探测本身生成 1 个 token → 健康引擎下轮即 growing、停滞计时自动重置,故对真空闲引擎约每

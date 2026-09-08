@@ -40,8 +40,18 @@ func envInt(k string, def int) int {
 // hotConfig:可热加载的判活参数(ConfigMap 改了不用滚 pod)。
 type hotConfig struct {
 	PollIntervalSec   int `json:"poll_interval_sec"`
-	StallSec          int `json:"stall_sec"`           // token 停滞多久(且 running>0)判 hang;对齐 monitor GRACE=180
+	StallSec          int `json:"stall_sec"`           // token 停滞多久(且 running>0)判 hang
 	MetricsTimeoutSec int `json:"metrics_timeout_sec"` // 拉 /metrics 超时
+
+	// 日志快判(可选,默认关):配了 log_file 才启用。progress 停滞 >= log_stall_sec(默认 30s)
+	// 【且】引擎日志最近 log_window_sec 内出现过 log_hang_pattern → 直接判 hang,不必等满
+	// stall_sec(60s)。两个独立信号叠加,置信度够,判定更快。
+	// 与 stall_sec 路径是【或】关系:日志没喊仍按 stall_sec 判,检测能力只增不减。
+	// sglang 场景无需额外流量:openresty 每秒打的 /health 就是真探活(见 logtail.go 头部说明)。
+	LogFile        string `json:"log_file"`         // 日志路径,支持 glob(如 /var/log/pods/<ns>_<pod>_*/sglang/*.log)
+	LogHangPattern string `json:"log_hang_pattern"` // 特征行正则;留空用 detokenizer 超时默认值
+	LogWindowSec   int    `json:"log_window_sec"`   // 特征行时效窗
+	LogStallSec    int    `json:"log_stall_sec"`    // 有日志佐证时的【短】停滞阈值(默认 30,远小于 stall_sec)
 
 	// 主动探测(可选,默认关):疑似 stall-hang 时主动打一下引擎确认,通了不判 hang(减少误杀)。
 	ActiveProbeEnabled    bool   `json:"active_probe_enabled"`
@@ -54,8 +64,12 @@ type hotConfig struct {
 func defaultHot() hotConfig {
 	return hotConfig{
 		PollIntervalSec:       envInt("POLL_INTERVAL_SEC", 15),
-		StallSec:              envInt("STALL_SEC", 180),
+		StallSec:              envInt("STALL_SEC", 60),
 		MetricsTimeoutSec:     envInt("METRICS_TIMEOUT_SEC", 10),
+		LogFile:               envOr("LOG_FILE", ""),
+		LogHangPattern:        envOr("LOG_HANG_PATTERN", ""),
+		LogWindowSec:          envInt("LOG_WINDOW_SEC", 120),
+		LogStallSec:           envInt("LOG_STALL_SEC", 30),
 		ActiveProbeEnabled:    false,
 		ActiveProbePath:       "/health_generate",
 		ActiveProbeMethod:     "GET",
@@ -173,14 +187,50 @@ func main() {
 	if fi, err := os.Stat(configFile); err == nil {
 		lastMtime = fi.ModTime() // 预置:首轮不再冗余重读,「热更」日志只在真改动时出
 	}
-	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds 主动探测=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot))
+	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot), logDesc(hot))
+
+	// 日志二次确认(log_file 配了才启)。pattern/路径是启动期固定的,不参与热更 ——
+	// 换路径要滚 pod;窗口 log_window_sec 也在启动时定,想热调再说(改一行即可)。
+	var tailer *logTailer
+	if hot.LogFile != "" {
+		t, terr := newLogTailer(hot.LogFile, hot.LogHangPattern)
+		if terr != nil {
+			log.Printf("日志确认启用失败(pattern 编译错:%v),退回纯 progress 判定", terr)
+		} else {
+			tailer = t
+			defer tailer.close()
+			w.enableLogConfirm(time.Duration(hot.LogStallSec)*time.Second, time.Duration(hot.LogWindowSec)*time.Second)
+			log.Printf("日志快判已启用:glob=%s log_stall=%ds window=%ds pattern=%s", hot.LogFile, hot.LogStallSec, hot.LogWindowSec, tailer.pattern.String())
+		}
+	}
+	var lastLogErr string
 
 	for {
 		// 热加载配置(仅 mtime 变时重读 + 打日志)
 		if fi, err := os.Stat(configFile); err == nil && fi.ModTime() != lastMtime {
 			lastMtime = fi.ModTime()
 			hot = loadHot(configFile, defaults)
-			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds 主动探测=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot))
+			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot), logDesc(hot))
+		}
+
+		if tailer != nil {
+			hits, lerr := tailer.poll()
+			w.noteLogHits(time.Now(), hits, lerr)
+			if hits > 0 {
+				log.Printf("引擎日志命中 hang 特征 %d 行(仅在 progress 也停滞时才判 hang)", hits)
+			}
+			cur := ""
+			if lerr != nil {
+				cur = lerr.Error()
+			}
+			if cur != lastLogErr { // 通道状态变化才打,免刷屏
+				lastLogErr = cur
+				if cur != "" {
+					log.Printf("日志通道不可用(%s)→ 本轮起退回纯 progress 判定", cur)
+				} else {
+					log.Printf("日志通道恢复可读")
+				}
+			}
 		}
 
 		text, err := fetchMetrics(client, engineURL, time.Duration(hot.MetricsTimeoutSec)*time.Second)
@@ -237,3 +287,11 @@ func fetchMetrics(client *http.Client, base string, timeout time.Duration) (stri
 type httpErr struct{ code int }
 
 func (e *httpErr) Error() string { return "HTTP " + strconv.Itoa(e.code) }
+
+// logDesc:日志快判配置的一行摘要(供启动/热更日志)。
+func logDesc(h hotConfig) string {
+	if h.LogFile == "" {
+		return "off"
+	}
+	return "on(" + h.LogFile + ",停滞" + strconv.Itoa(h.LogStallSec) + "s+日志,窗口" + strconv.Itoa(h.LogWindowSec) + "s)"
+}

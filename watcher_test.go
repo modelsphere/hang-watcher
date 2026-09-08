@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -51,6 +52,26 @@ vllm:num_requests_running{engine="1"} 4
 	none := parseMetrics("process_start_time_seconds 123\n")
 	if none.haveTP {
 		t.Errorf("无 progress 计数时 haveTP 应 false")
+	}
+
+	// sglang:realtime_tokens_total 必须计入 token_progress(带 mode label 的多系列求和)。
+	// 它是 iteration 级的,*_tokens_total 是请求结束才累加 —— 少了它长请求会被误判 hang。
+	rt := `sglang:generation_tokens_total 1000
+sglang:prompt_tokens_total 5000
+sglang:realtime_tokens_total{mode="decode"} 700
+sglang:realtime_tokens_total{mode="prefill_compute"} 200
+sglang:realtime_tokens_total{mode="prefill_cache"} 100
+sglang:num_running_reqs 1
+`
+	r := parseMetrics(rt)
+	if r.tp != 7000 {
+		t.Errorf("含 realtime 的 tp = %v, 想要 7000(1000+5000+700+200+100)", r.tp)
+	}
+
+	// 旧版 sglang 无 realtime_tokens_total → 退化回原四项,不 panic 不丢 haveTP
+	old := parseMetrics("sglang:generation_tokens_total 42\n")
+	if !old.haveTP || old.tp != 42 {
+		t.Errorf("旧引擎(无 realtime)应退化为 tp=42,实际 %v(have=%v)", old.tp, old.haveTP)
 	}
 }
 
@@ -105,6 +126,27 @@ func TestWatcherVerdict(t *testing.T) {
 	w3.step(t0.Add(15*time.Second), snap(10, 1), nil, stall, nil) // 倒退
 	if h, _, _ := w3.Hung(); h {
 		t.Errorf("计数器倒退应重置基线、健康")
+	}
+
+	// ⑦b 回归:长请求场景 —— *_tokens_total 全程冻结(请求未结束不累加),
+	//      仅 realtime_tokens_total 在涨。tp 是求和,必须因此判「在干活」而非 hang。
+	//      少了 realtime 项时,这里会在 stall 后误杀一台正常实例。
+	//      走真实 /metrics 文本(经 parseMetrics),这样删掉 progressMetrics 里的 realtime 项时这里会红。
+	w3b := newWatcher()
+	realtime := 500
+	text := func(rt int) string { // gen/prompt 恒定,只有 realtime 在推进
+		return fmt.Sprintf("sglang:generation_tokens_total 800\n"+
+			"sglang:prompt_tokens_total 200\n"+
+			"sglang:realtime_tokens_total{mode=\"decode\"} %d\n"+
+			"sglang:num_running_reqs 1\n", rt)
+	}
+	w3b.step(t0, parseMetrics(text(realtime)), nil, stall, nil) // 基线
+	for i := 1; i <= 12; i++ {                                  // 12×30s = 360s > stall
+		realtime += 40 // 每轮 decode iteration 推进
+		w3b.step(t0.Add(time.Duration(i)*30*time.Second), parseMetrics(text(realtime)), nil, stall, nil)
+	}
+	if h, _, r := w3b.Hung(); h {
+		t.Errorf("长请求(仅 realtime 在涨)不应判 hang,实际 hang(%s)", r)
 	}
 
 	// ⑧ started 后持续不可达超 stall → HANG(引擎 HTTP 层死)
