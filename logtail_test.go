@@ -121,7 +121,26 @@ func TestLogTailerPattern(t *testing.T) {
 		t.Errorf("自定义 pattern 应只命中 EngineCore 那行(1),实际 %d", h)
 	}
 
-	// ③ 非法正则 -> 报错(main.go 据此打日志并退回纯 progress 判定,不 crash)
+	// ③ 多个特征行:pattern 是【一条正则】,用 | 交替即可,不是列表也不与默认叠加。
+	//    配了 pattern 就【完全取代】内置默认;想同时保留默认,把它写进交替分支里。
+	p3 := filepath.Join(dir, "c.log")
+	writeLines(t, p3, "seed")
+	multi, err := newLogTailer(p3, defaultLogHangPattern+`|EngineCore encountered a fatal error|Watchdog timeout`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer multi.close()
+	multi.poll()
+	writeLines(t, p3,
+		sampleHang,
+		"ERROR EngineCore encountered a fatal error",
+		"ERROR Watchdog timeout (self.watchdog_last_forward_ct=...)",
+		"INFO 无关行")
+	if h, _ := multi.poll(); h != 3 {
+		t.Errorf("交替 pattern 应命中 3 行,实际 %d", h)
+	}
+
+	// ④ 非法正则 -> 报错(main.go 据此打日志并退回纯 progress 判定,不 crash)
 	if _, err := newLogTailer(p, "("); err == nil {
 		t.Errorf("非法正则应返回 err")
 	}

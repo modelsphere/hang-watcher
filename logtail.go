@@ -24,6 +24,9 @@ import (
 
 // 默认特征:sglang detokenizer 无响应。前缀匹配即可,后面的 "for last 20 seconds" 里的秒数
 // 随 SGLANG_HEALTH_CHECK_TIMEOUT 变,不写进 pattern。
+//
+// pattern 是【一条正则】,不是列表:配了就【完全取代】这个默认值,不做叠加。要匹配多种特征行
+// 用交替 `a|b|c`;想在自定义之外仍保留默认,把默认那段也写进交替分支里。
 const defaultLogHangPattern = `Health check failed\. Server couldn't get a response from detokenizer`
 
 // 单轮最多读的新增字节。超出说明日志爆量,直接跳到文件末尾(只关心「最近有没有」,不必读全)。
