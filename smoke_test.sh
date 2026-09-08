@@ -22,7 +22,9 @@ PY
 FAKE=$!
 sleep 1
 
-echo '{"poll_interval_sec":1,"stall_sec":2,"metrics_timeout_sec":3}' > "$WORK/config.json"
+# ⚠️ 显式关主动探测:它现在默认【开】,而下面的假引擎对任何 GET 都答 200 ->
+#    探测恒成功 -> 判定停在 stall-active-ok,永远等不到 503。本段验的是被动路径。
+echo '{"poll_interval_sec":1,"stall_sec":2,"metrics_timeout_sec":3,"active_probe_enabled":false}' > "$WORK/config.json"
 ENGINE_URL="http://127.0.0.1:$EPORT" LISTEN="127.0.0.1:$HPORT" CONFIG_FILE="$WORK/config.json" \
   "$WORK/hang-watcher" > "$WORK/sc.log" 2>&1 &
 SC=$!
@@ -40,7 +42,7 @@ kill $SC 2>/dev/null; wait $SC 2>/dev/null; SC=
 LOGDIR="$WORK/pods/ns_pod_uid/sglang"; mkdir -p "$LOGDIR"
 echo "2026-09-08T04:00:00.000000000Z stdout F [启动] INFO 正常行" > "$LOGDIR/0.log"
 
-echo '{"poll_interval_sec":1,"stall_sec":60,"metrics_timeout_sec":3}' > "$WORK/config2.json"
+echo '{"poll_interval_sec":1,"stall_sec":60,"metrics_timeout_sec":3,"active_probe_enabled":false}' > "$WORK/config2.json"
 ENGINE_URL="http://127.0.0.1:$EPORT" LISTEN="127.0.0.1:$HPORT" CONFIG_FILE="$WORK/config2.json" \
   LOG_FILE="$WORK/pods/ns_pod_*/sglang/*.log" LOG_WINDOW_SEC=30 LOG_STALL_SEC=3 \
   "$WORK/hang-watcher" > "$WORK/sc2.log" 2>&1 &

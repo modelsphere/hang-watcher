@@ -63,17 +63,29 @@ type hotConfig struct {
 
 func defaultHot() hotConfig {
 	return hotConfig{
-		PollIntervalSec:       envInt("POLL_INTERVAL_SEC", 15),
-		StallSec:              envInt("STALL_SEC", 60),
-		MetricsTimeoutSec:     envInt("METRICS_TIMEOUT_SEC", 10),
-		LogFile:               envOr("LOG_FILE", ""),
-		LogHangPattern:        envOr("LOG_HANG_PATTERN", ""),
-		LogWindowSec:          envInt("LOG_WINDOW_SEC", 120),
-		LogStallSec:           envInt("LOG_STALL_SEC", 30),
-		ActiveProbeEnabled:    false,
+		// 这一组默认值 = 2026-09-08 在测试集群 the test cluster 上用 SIGSTOP 造真 hang、逐项调参
+		// 实测出来的:从 hang 发生到调用方连接被切断 420s+ -> 50s。构成大致是
+		//   stall 30 + poll <=5 + 主动探测 5 + kubelet liveness 2x5 + preStop/退出。
+		// 与 sglang chart 的 hangWatcher.config 默认值保持一致 —— 不挂 ConfigMap 直接跑这个
+		// 二进制,行为应当和 chart 部署出来的一样。
+		PollIntervalSec:   envInt("POLL_INTERVAL_SEC", 5),
+		StallSec:          envInt("STALL_SEC", 30),
+		MetricsTimeoutSec: envInt("METRICS_TIMEOUT_SEC", 10),
+		LogFile:           envOr("LOG_FILE", ""),
+		LogHangPattern:    envOr("LOG_HANG_PATTERN", ""),
+		LogWindowSec:      envInt("LOG_WINDOW_SEC", 120),
+		LogStallSec:       envInt("LOG_STALL_SEC", 30),
+		// 主动探测默认【开】(此前默认关)。纯被动路径分不清「真空闲」和「调度器卡死导致
+		// 没有在途请求」—— 两种情况 running 都是 0,wedged-idle 只能靠它兜。
+		// 端点用 /health_generate 而非 /v1/completions:两者都走到 scheduler,但前者有界 ——
+		// 收到 scheduler 任何回应就立刻返回,并在引擎自己的 SGLANG_HEALTH_CHECK_TIMEOUT(20s)
+		// 处答 503;后者要真跑完一次生成,耗时受排队影响、没有上界(所以它的超时被迫给到 60s)。
+		// 超时 5s:探测只在进度已冻结 stall_sec(30s)之后才发起,正常出词的引擎根本走不到;
+		// 空闲引擎的 1-token 请求会被立刻调度。实测 5s 足够,且它曾是 stall 之后最大的一块开销。
+		ActiveProbeEnabled:    true,
 		ActiveProbePath:       "/health_generate",
 		ActiveProbeMethod:     "GET",
-		ActiveProbeTimeoutSec: 20,
+		ActiveProbeTimeoutSec: 5,
 	}
 }
 
