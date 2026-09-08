@@ -118,6 +118,15 @@ func loadHot(path string, base hotConfig) hotConfig {
 	if cur.ActiveProbeTimeoutSec <= 0 {
 		cur.ActiveProbeTimeoutSec = base.ActiveProbeTimeoutSec
 	}
+	// 这两个此前漏了兜底。log_stall_sec 若是 0,「停滞 >= 0s 且窗口内有日志」就恒成立 ——
+	// 任何一条特征行都会立刻判 hang。ConfigMap 是模板渲染出来的,缺键渲染成 0 完全可能
+	// (helm --reuse-values 就会让新增键取不到默认值),所以别指望上游一定给对。
+	if cur.LogStallSec <= 0 {
+		cur.LogStallSec = base.LogStallSec
+	}
+	if cur.LogWindowSec <= 0 {
+		cur.LogWindowSec = base.LogWindowSec
+	}
 	return cur
 }
 
