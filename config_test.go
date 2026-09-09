@@ -117,3 +117,32 @@ func TestLogFastPathShortCircuitsProbe(t *testing.T) {
 		t.Errorf("走了日志快判就不该再调主动探测(白花一次探测时间,而且探测成功会盖掉正确裁决)")
 	}
 }
+
+// log_stall_sec / log_window_sec 必须能热更。它们和 stall_sec 一样写在 ConfigMap 里、
+// loadHot 也会重读,但 watcher 是在【启动时】通过 enableLogConfirm 捕获它们的 ——
+// 若热更分支里不重新灌一遍,改 ConfigMap 只会改变"配置热更"那行日志、不改变行为。
+func TestLogConfirmHotReload(t *testing.T) {
+	stall := 300 * time.Second
+	t0 := time.Unix(1000, 0)
+	snap := func(tp, running float64) metricsSnap { return metricsSnap{tp: tp, haveTP: true, running: running} }
+
+	w := newWatcher()
+	w.enableLogConfirm(120*time.Second, 120*time.Second) // 初始:log_stall=120
+	w.step(t0, snap(1000, 1), nil, stall, nil)
+
+	at := t0.Add(40 * time.Second)
+	w.noteLogHits(at.Add(-5*time.Second), 1, nil)
+	w.step(at, snap(1000, 1), nil, stall, nil)
+	if h, _, _ := w.Hung(); h {
+		t.Fatalf("停滞 40s < log_stall 120s,不该判 hang")
+	}
+
+	// 模拟热更:log_stall 120 -> 30
+	w.enableLogConfirm(30*time.Second, 120*time.Second)
+	at2 := t0.Add(45 * time.Second)
+	w.noteLogHits(at2.Add(-5*time.Second), 1, nil)
+	w.step(at2, snap(1000, 1), nil, stall, nil)
+	if h, st, r := w.Hung(); !h || st != "stall-hang-log" {
+		t.Errorf("热更后 log_stall=30,停滞 45s + 日志特征应快判 hang;实际 hung=%v state=%s(%s)", h, st, r)
+	}
+}

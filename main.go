@@ -244,6 +244,13 @@ func main() {
 			lastMtime = fi.ModTime()
 			hot = loadHot(configFile, defaults)
 			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot), logDesc(hot))
+			// 这两个值是启动时捕获进 watcher 的,不像其它配置那样每轮从 hot 现取 ——
+			// 不在这里重新灌一遍,改 ConfigMap 就只会改变上面那行日志、不改变行为,
+			// 运维看着"配置热更"以为生效了其实没有。log_file / log_hang_pattern 确实
+			// 换不了(tailer 启动时建好),那两个改了仍需滚 pod,见 values.yaml 注释。
+			if tailer != nil {
+				w.enableLogConfirm(time.Duration(hot.LogStallSec)*time.Second, time.Duration(hot.LogWindowSec)*time.Second)
+			}
 		}
 
 		if tailer != nil {
