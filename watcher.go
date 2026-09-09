@@ -46,6 +46,13 @@ var progressMetrics = map[string]bool{
 	"sglang:generation_tokens_total": true,
 	"sglang:prompt_tokens_total":     true,
 	"sglang:realtime_tokens_total":   true,
+	// forward pass 计数器,与 realtime_tokens_total 同一处累加(metrics_reporter 每个 forward)。
+	// 语义上比 token 数更直接:它数的就是「调度器循环转了几圈」,decode/prefill、走不走
+	// cuda graph 都 +1(value 只决定 mode 标签,不决定加不加)。
+	// 作为【冗余】信号加入:sglang v0.5.10.post1 上还没有这个指标(实测 grep -c = 0),
+	// v0.5.19 才有,所以它替代不了 realtime_tokens_total,只是多一条腿 —— 万一将来
+	// realtime 被改名/删掉,判活不至于直接退回 finish-only 口径。
+	"sglang:cuda_graph_passes_total": true,
 }
 
 // metricsSnap:一轮 /metrics 解析结果。

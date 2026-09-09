@@ -68,6 +68,18 @@ sglang:num_running_reqs 1
 		t.Errorf("含 realtime 的 tp = %v, 想要 7000(1000+5000+700+200+100)", r.tp)
 	}
 
+	// cuda_graph_passes_total 也计入:它是 forward pass 计数器(decode/prefill 各带 mode 标签),
+	// 与 realtime 同一处累加。作为冗余信号 —— 老版本(v0.5.10.post1)没有它,新版本才有。
+	cg := `sglang:generation_tokens_total 100
+sglang:realtime_tokens_total{mode="decode"} 200
+sglang:cuda_graph_passes_total{mode="decode_cuda_graph"} 30
+sglang:cuda_graph_passes_total{mode="prefill_none"} 7
+sglang:num_running_reqs 1
+`
+	if got := parseMetrics(cg); got.tp != 337 {
+		t.Errorf("含 cuda_graph_passes 的 tp = %v, 想要 337(100+200+30+7)", got.tp)
+	}
+
 	// 旧版 sglang 无 realtime_tokens_total → 退化回原四项,不 panic 不丢 haveTP
 	old := parseMetrics("sglang:generation_tokens_total 42\n")
 	if !old.haveTP || old.tp != 42 {
