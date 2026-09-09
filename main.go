@@ -226,6 +226,18 @@ func main() {
 	}
 	var lastLogErr string
 
+	// 主动探测失败后的复核回调:重新拉一次 /metrics 取 token_progress。
+	// 探测会耗掉 active_probe_timeout_sec,期间引擎可能已恢复出词,而 step() 手上的快照
+	// 是探测【之前】拉的、已经过期 —— 不复核就会把「探测被一次超长 forward 挡住」当成 hang。
+	w.setRecheck(func() (float64, bool) {
+		txt, err := fetchMetrics(client, engineURL, time.Duration(hot.MetricsTimeoutSec)*time.Second)
+		if err != nil {
+			return 0, false
+		}
+		s := parseMetrics(txt)
+		return s.tp, s.haveTP
+	})
+
 	for {
 		// 热加载配置(仅 mtime 变时重读 + 打日志)
 		if fi, err := os.Stat(configFile); err == nil && fi.ModTime() != lastMtime {

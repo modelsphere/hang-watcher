@@ -217,3 +217,53 @@ func TestActiveProbe(t *testing.T) {
 		t.Errorf("被动模式 running==0 冻结应仍判空闲(分不清 wedged/空闲)")
 	}
 }
+
+// 主动探测失败后的复核。探测本身要耗 active_probe_timeout_sec,那段时间里引擎可能已经恢复
+// 出词(典型:卡在一次超长 forward 里,forward 在探测等待期间结束了),而 step() 手上的快照
+// 是探测【之前】拉的、已经过期。不复核就会把这种情况判成 hang。
+func TestProbeFailRecheck(t *testing.T) {
+	stall := 30 * time.Second
+	t0 := time.Unix(1000, 0)
+	snap := func(tp, running float64) metricsSnap { return metricsSnap{tp: tp, haveTP: true, running: running} }
+	failProbe := func() bool { return false }
+
+	// ① 探测失败,但复核发现 progress 已经涨了 → 不判 hang,并把停滞计时重置
+	w := newWatcher()
+	w.setRecheck(func() (float64, bool) { return 1500, true }) // 探测期间涨到 1500
+	w.step(t0, snap(1000, 1), nil, stall, failProbe)
+	w.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	if h, st, r := w.Hung(); h || st != "probe-fail-but-growing" {
+		t.Errorf("探测失败但复核有进度,不应判 hang;实际 hung=%v state=%s(%s)", h, st, r)
+	}
+	// 复核成功后停滞计时应归零:紧接着再来一轮(仍是旧 tp)不该立刻判 hang
+	w.step(t0.Add(stall+2*time.Second), snap(1500, 1), nil, stall, failProbe)
+	if h, _, _ := w.Hung(); h {
+		t.Errorf("复核后 lastGrow 应已刷新,下一轮不该马上判 hang")
+	}
+
+	// ② 探测失败且复核仍无进度 → 判 hang(原行为)
+	w2 := newWatcher()
+	w2.setRecheck(func() (float64, bool) { return 1000, true }) // 没动
+	w2.step(t0, snap(1000, 1), nil, stall, failProbe)
+	w2.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	if h, _, r := w2.Hung(); !h {
+		t.Errorf("探测失败且复核无进度应判 hang,实际健康(%s)", r)
+	}
+
+	// ③ 复核本身拿不到数(/metrics 也挂了)→ 不能因此放过,仍判 hang
+	w3 := newWatcher()
+	w3.setRecheck(func() (float64, bool) { return 0, false })
+	w3.step(t0, snap(1000, 1), nil, stall, failProbe)
+	w3.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	if h, _, r := w3.Hung(); !h {
+		t.Errorf("复核取不到数时不该放过(引擎连 /metrics 都答不了更像真死),实际健康(%s)", r)
+	}
+
+	// ④ 没注册复核(nil)→ 完全走原行为
+	w4 := newWatcher()
+	w4.step(t0, snap(1000, 1), nil, stall, failProbe)
+	w4.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	if h, _, _ := w4.Hung(); !h {
+		t.Errorf("未注册复核时应保持原行为(探测失败即判 hang)")
+	}
+}

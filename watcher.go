@@ -6,6 +6,8 @@
 //     (sglang 靠 realtime_tokens_total 提供 iteration 级信号,
 //     *_tokens_total 是请求结束才累加的,单独用会误杀长请求)
 //  3. 停滞 + running>0   —— 计数器不涨、却有在途请求 → 真 hang
+//     (开了主动探测时:停滞 → 探一次 → 失败后【再复核一次 progress】,仍无进度才判 hang;
+//     探测耗时期间引擎可能已恢复,手上的快照是探测前拉的、已过期)
 //  4. 空闲豁免           —— 停滞但 running==0 → 空闲,健康(不误杀半夜无流量)
 //  5. 冻结宽限           —— 计数器冻结但 GRACE 秒内出过词 → 容忍大 prefill 批
 //  6. 日志快判(可选)   —— 停滞 log_stall_sec(默认 30,短于 stall_sec)+ 引擎日志最近喊过
@@ -117,6 +119,18 @@ type watcher struct {
 	logStall   time.Duration // 有日志佐证时的【短】停滞阈值(远小于 stall_sec)
 	lastLogHit time.Time     // 最近一次匹配到特征行的时刻
 	logBroken  bool          // 日志读不了(文件缺失/权限)→ 退回纯 progress 判定,不因此漏杀
+
+	// 探测失败后的复核:重新取一次 token_progress。见 step() 里的调用点。
+	recheck func() (float64, bool)
+}
+
+// setRecheck:注册「再取一次 token_progress」的回调。主动探测失败后用它复核 ——
+// 探测本身会耗掉 active_probe_timeout_sec,那段时间里引擎可能已经恢复出词。
+// 不注册(nil)则退回原行为:探测失败即判 hang。
+func (w *watcher) setRecheck(f func() (float64, bool)) {
+	w.mu.Lock()
+	w.recheck = f
+	w.mu.Unlock()
 }
 
 // enableLogConfirm:开启日志快判。停滞 >= logStall 且 window 内出现过特征行 → 直接判 hang。
@@ -227,7 +241,20 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 			w.set(false, "stall-active-ok", "token 停滞 "+stalled+"(running="+ftoa(m.running)+"),主动探测存活 → 不判 hang")
 			return
 		}
-		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测失败(running="+ftoa(m.running)+")→ hang")
+		// 探测失败 ≠ 立刻判死。探测本身刚刚耗掉了 active_probe_timeout_sec(默认 5s,曾是 60s),
+		// 这段时间里引擎完全可能已经恢复出词 —— 典型情形是它卡在一次超长 forward 里,而那次
+		// forward 在探测等待期间结束了。此时手上的 m 是【探测之前】拉的快照,已经过期。
+		// 所以再取一次 progress:涨了就说明引擎在干活,探测超时只是被那次 forward 挡住了。
+		// 这把「探测超时」从判死的【充分证据】降级成【必要条件之一】。
+		if w.recheck != nil {
+			if tp, ok := w.recheck(); ok && tp > w.lastTP {
+				w.set(false, "probe-fail-but-growing", "token 停滞 "+stalled+"、主动探测失败,但复核发现 progress 已推进 +"+
+					ftoa(tp-w.lastTP)+" → 不判 hang(探测期间引擎恢复了)")
+				w.lastTP, w.lastGrow = tp, now
+				return
+			}
+		}
+		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测失败且复核仍无进度(running="+ftoa(m.running)+")→ hang")
 		return
 	}
 	// 纯被动(未开主动探测):只有在途请求还卡着才敢判 hang;running==0 分不清 wedged/空闲 → 放过。
