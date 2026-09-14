@@ -197,6 +197,9 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		if w.firstFail.IsZero() {
 			w.firstFail = now
 		}
+		// 引擎失联期间探不了,计数清零 —— 否则恢复之后日志里的「连续失败 N 次」会把失联
+		// 前后两段拼在一起,读起来像是一直在失败。
+		w.probeFails = 0
 		if now.Sub(w.firstFail) >= stall {
 			w.set(true, "unreach-hang", "引擎 /metrics 持续无响应 "+dur(now.Sub(w.firstFail)))
 		} // 未超 stall:保持上次裁决(短暂抖动不误杀)
@@ -252,8 +255,10 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	// 一次 forward,而 sglang:realtime_tokens_total 是 metrics_reporter 每个 forward 自增的
 	// (与 health_generate 内部的 log_metrics=False 无关,那只影响 generation_tokens_total),
 	// 所以成功的探测会推进 token_progress → 下一轮进 growing → lastGrow 归零。
-	// 于是 stalledFor 能累加到 stall_sec,当且仅当这期间【每次探测都失败】。按 30s/5s 算连败 4 次
-	// 以上才判死,而判死时机(30s)一点没变。
+	// 于是 stalledFor 能累加到 stall_sec,当且仅当这期间【每次探测都失败】。
+	// 失败的探测会同步阻塞 active_probe_timeout_sec,而 poll 的 sleep 在干完活之后,所以真 hang 时
+	// 一轮是 timeout+poll(默认 5+5=10s)—— 30s 里连败约 3 次才判死,判死时机也因此比 stall_sec
+	// 晚不到一轮。单次抖动杀不死引擎,这是本次改动的全部目的。
 	//
 	// 开销:有流量时 progress 本来就在涨,走不到这里,零新增。空闲引擎从约每 stall_sec 一次变成约
 	// 每 2 个 poll 一次,单次是 1 token 的生成,可忽略。
