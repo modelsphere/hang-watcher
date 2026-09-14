@@ -243,29 +243,20 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	stalled := dur(stalledFor)
 	// 开了主动探测:【每一轮停滞都探】,不再等满 stall_sec 才探第一次。
 	//
-	// 为什么从「满 stall_sec 探一次」改成「每轮都探」(2026-09-14):
-	// 旧行为下,判死链路上只有【一次】探测 —— 停滞满 30s 触发探测,一旦这次探测超时(5s)且复核
-	// 无进度,立刻 hung=true。而 hung 之后 kubelet 的 livenessProbe 只需 2×5s 就会 Killing,
-	// 下一轮 poll(5s)+ 下一次探测(最多 5s)得出的结论恰好和 Killing 同时到达 —— 补救机会形同
-	// 虚设。也就是说:任何一次偶发的 5s 超时(GC、瞬时抖动、一次偏慢的响应)都足以杀掉一台健康引擎。
+	// 旧行为下判死链路上只有【一次】探测:停滞满 stall_sec 才探,这次超时(默认 5s)+ 复核无进度
+	// 就立刻 hung=true。而 hung 之后 kubelet 的 livenessProbe 只需 2×5s 就 Killing,下一轮
+	// poll(5s)+ 下次探测(最多 5s)的结论恰好与 Killing 同时到达 —— 补救机会形同虚设。
+	// 结果是任何一次偶发的 5s 超时(GC、瞬时抖动、一次偏慢的响应)都足以杀掉一台健康引擎。
 	//
-	// 改成每轮都探之后,判死条件不用动就自带了「连续失败」语义:
-	// 探测走 /health_generate,成功时会真跑一次 forward,sglang:realtime_tokens_total 是
-	// metrics_reporter 每个 forward 自增的(与 health_generate 的 log_metrics=False 无关,
-	// 那个只影响 generation_tokens_total),所以【成功的探测会推进 token_progress】→ 下一轮进
-	// growing 分支 → lastGrow 归零。
-	// 于是 stalledFor 能一路累加到 stall_sec,当且仅当这段时间里【每一次探测都失败】。
-	// 30s / 5s ≈ 连败 4 次以上才判死,单次抖动再也杀不死引擎,而判死时机(30s)一点没变。
+	// 每轮都探之后,判死条件不用动就自带了「连续失败」语义:探测走 /health_generate,成功时会真跑
+	// 一次 forward,而 sglang:realtime_tokens_total 是 metrics_reporter 每个 forward 自增的
+	// (与 health_generate 内部的 log_metrics=False 无关,那只影响 generation_tokens_total),
+	// 所以成功的探测会推进 token_progress → 下一轮进 growing → lastGrow 归零。
+	// 于是 stalledFor 能累加到 stall_sec,当且仅当这期间【每次探测都失败】。按 30s/5s 算连败 4 次
+	// 以上才判死,而判死时机(30s)一点没变。
 	//
-	// ⚠️ 退化情形:旧版 sglang 没有 realtime_tokens_total(progressMetrics 退回 finish-only 的
-	// 四项)时,1-token 的探测不会推进 progress,停滞计时不会被成功的探测按回零。此时行为是
-	// 「每轮探、只要探得通就一直 stall-active-ok」—— 判不出 hang,但也不会误杀;探测一旦真的
-	// 打不通,停滞计时照样累加到 stall_sec 判死。方向是安全的,只是失去了上面那个连败语义。
-	//
-	// 代价:空闲引擎的探测频率从约每 stall_sec 一次变成约每 2 个 poll 一次(探测成功那轮推进
-	// progress,下一轮走 growing 不探,再下一轮才探)。单次探测是 1 个 token 的生成,且
-	// /health_generate 在引擎有活干时会直接返回(只要 detokenizer 最近有任何响应就算存活),
-	// 开销可忽略。有流量时 progress 本来就在涨,根本走不到这里,零新增开销。
+	// 开销:有流量时 progress 本来就在涨,走不到这里,零新增。空闲引擎从约每 stall_sec 一次变成约
+	// 每 2 个 poll 一次,单次是 1 token 的生成,可忽略。
 	if probe != nil {
 		if probe() {
 			w.probeFails = 0

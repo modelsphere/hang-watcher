@@ -26,13 +26,12 @@
 这样既保留原「running>0 停滞」的确认,又补上 **wedged-idle(running=0)** 盲区,完全对齐 monitor(末环就是冻结超 grace → 主动 `/v1/completions` 确认)。默认关时行为与之前完全一致(纯被动:running==0 冻结仍判空闲)。
 
 #### 为什么是「每轮探」而不是「满 stall_sec 探一次」(2026-09-14 改)
-旧行为下判死链路上只有**一次**探测:停滞满 `stall_sec` 才探,这一次超时(`active_probe_timeout_sec`,默认 5s)+ 复核无进度就立刻 `hung=true`。而 hung 之后 kubelet 的 livenessProbe 只需 `2×5s` 就会 Killing,下一轮 poll(5s)+ 下一次探测(最多 5s)得出的结论恰好与 Killing 同时到达 —— 补救机会形同虚设。**任何一次偶发的 5s 超时(GC、瞬时抖动、一次偏慢的响应)都足以杀掉一台健康引擎。**
+旧行为下判死链路上只有**一次**探测:停滞满 `stall_sec` 才探,这次超时(`active_probe_timeout_sec`,默认 5s)+ 复核无进度就立刻 `hung=true`。而 hung 之后 kubelet 的 livenessProbe 只需 `2×5s` 就 Killing,下一轮 poll(5s)+ 下次探测(最多 5s)的结论恰好与 Killing 同时到达 —— 补救机会形同虚设。**任何一次偶发的 5s 超时(GC、瞬时抖动、一次偏慢的响应)都足以杀掉一台健康引擎。**
 
-改成每轮都探之后,判死条件不用动就自带了「连续失败」语义:探测走 `/health_generate`,成功时会真跑一次 forward,而 `sglang:realtime_tokens_total` 是 metrics_reporter **每个 forward** 自增的(与 `health_generate` 内部 `log_metrics=False` 无关,那个只影响 `generation_tokens_total`),所以**成功的探测会推进 token_progress** → 下一轮进 `growing` → 停滞计时归零。于是 `stalledFor` 能一路累加到 `stall_sec`,**当且仅当这段时间里每一次探测都失败**。按默认值 30s/5s 算,连败 4 次以上才判死,而**判死时机(30s)一点没变**。
+每轮都探之后,判死条件不用动就自带了「连续失败」语义:探测走 `/health_generate`,成功时会真跑一次 forward,而 `sglang:realtime_tokens_total` 是 metrics_reporter **每个 forward** 自增的,所以**成功的探测会推进 token_progress** → 下一轮进 `growing` → 停滞计时归零。于是 `stalledFor` 能累加到 `stall_sec`,**当且仅当这期间每次探测都失败**。按默认 30s/5s 算连败 4 次以上才判死,而**判死时机(30s)一点没变**。
 
-- **退化情形**:旧版 sglang 没有 `realtime_tokens_total`(progressMetrics 退回 finish-only 四项)时,1-token 探测不会推进 progress,停滞计时不会被成功的探测按回零。此时行为是「每轮探、只要探得通就一直 `stall-active-ok`」—— 判不出 hang,但也不会误杀;探测一旦真打不通,停滞计时照样累加到 `stall_sec` 判死。方向安全,只是失去连败语义。
-- **开销**:有流量时 progress 本来就在涨,走不到探测分支,零新增开销。空闲引擎的探测频率从约每 `stall_sec` 一次变成约每 2 个 poll 一次(探测成功那轮推进 progress,下一轮 `growing` 不探,再下一轮才探)。单次是 1 token 的生成;且 `/health_generate` 在引擎有活干时会直接返回(判据是 `last_receive_tstamp` —— detokenizer 最近有**任何**响应就算存活,不必是自己那条请求),开销可忽略。
-- **仍未覆盖**:超长 prefill 期间 scheduler 卡在 forward 里,探测**每次都会超时**,多探不能把它和真 wedged 区分开。实测 160k+ prompt 的 TTFT p90 达 13.56s,单条 129k token 的 prefill 实测 14.7s —— 若这类请求连续排队使 progress 冻结超 `stall_sec`,仍会误判。要覆盖需调大 `active_probe_timeout_sec` 或引入 prefill 阶段的独立信号。
+- **开销**:有流量时 progress 本来就在涨,走不到探测分支,零新增。空闲引擎从约每 `stall_sec` 一次变成约每 2 个 poll 一次,单次是 1 token 的生成;且 `/health_generate` 在引擎有活干时会直接返回(判据是 `last_receive_tstamp`,detokenizer 最近有**任何**响应就算存活),可忽略。
+- **仍未覆盖**:超长 prefill 期间 scheduler 卡在 forward 里,探测**每次都会超时**,多探不能把它和真 wedged 区分开。实测 160k+ prompt 的 TTFT p90 达 13.56s、单条 129k token 的 prefill 实测 14.7s。要覆盖需调大 `active_probe_timeout_sec` 或引入 prefill 阶段的独立信号。
 
 ### 与 monitor 的行为差异
 - **engine liveness 耦合 sidecar 可用性**:engine 的 livenessProbe 探本 sidecar `:9090`,故 **sidecar 崩溃/OOM/慢启 → 探针连不上 → 超 `failureThreshold×period` 会把健康的 engine 也重启**。Go 静态二进制重启 <1s、实际内存 ~10Mi(`/metrics` 有 8MB 读上限但真实响应通常 <100KB),45s 宽限远够;但**别把 sidecar 内存 limit 压太死**(建议 ≥64Mi)。
