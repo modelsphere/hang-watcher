@@ -279,3 +279,81 @@ func TestProbeFailRecheck(t *testing.T) {
 		t.Errorf("未注册复核时应保持原行为(探测失败即判 hang)")
 	}
 }
+
+// 每轮停滞都主动探测(2026-09-14 改动)。
+//
+// 旧行为:停滞满 stall_sec 才探【第一次】,这一次探测超时 + 复核无进度就立刻判 hang。
+// 而 hung 之后 kubelet livenessProbe 只需 2×5s 就 Killing,下一轮 poll 的补救结论恰好与
+// Killing 同时到达 —— 等于任何一次偶发的探测超时都能杀掉一台健康引擎。
+//
+// 新行为:每轮停滞都探。成功的探测会真跑一次 forward、推进 token_progress → 下轮 growing →
+// 停滞计时归零。于是「停滞累计到 stall_sec」当且仅当这期间每次探测都失败,判死时机不变,
+// 却自带了连败语义。
+func TestProbeEveryStalledPoll(t *testing.T) {
+	stall := 30 * time.Second
+	t0 := time.Unix(1000, 0)
+	snap := func(tp, running float64) metricsSnap { return metricsSnap{tp: tp, haveTP: true, running: running} }
+
+	// ① 停滞但未满 stall 时就应该已经探过了(旧行为此时根本不调 probe)
+	calls := 0
+	okProbe := func() bool { calls++; return true }
+	w := newWatcher()
+	w.step(t0, snap(1000, 0), nil, stall, okProbe)                    // 建基线
+	w.step(t0.Add(5*time.Second), snap(1000, 0), nil, stall, okProbe) // 停滞 5s,远小于 stall
+	if calls != 1 {
+		t.Fatalf("停滞 5s(<stall)就应主动探测一次,实际调用 %d 次", calls)
+	}
+	if h, st, r := w.Hung(); h || st != "stall-active-ok" {
+		t.Errorf("探测存活不应判 hang;实际 hung=%v state=%s(%s)", h, st, r)
+	}
+
+	// ② 探测失败但停滞未满 stall → 不判 hang,只累计失败次数
+	fails := 0
+	failProbe := func() bool { fails++; return false }
+	w2 := newWatcher()
+	w2.setRecheck(func() (float64, bool) { return 1000, true }) // 复核也没进度
+	w2.step(t0, snap(1000, 1), nil, stall, failProbe)
+	for i := 1; i <= 5; i++ { // 5s、10s ... 25s,都 < stall
+		w2.step(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, failProbe)
+		if h, st, r := w2.Hung(); h {
+			t.Fatalf("停滞 %ds(<stall)探测失败不应判 hang;实际 state=%s(%s)", i*5, st, r)
+		}
+	}
+	if fails != 5 {
+		t.Errorf("应每轮都探,5 轮期望 5 次探测,实际 %d 次", fails)
+	}
+	if w2.probeFails != 5 {
+		t.Errorf("连续失败计数应为 5,实际 %d", w2.probeFails)
+	}
+	// 满 stall 之后才判 hang,且此时已连败多次
+	w2.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	if h, st, _ := w2.Hung(); !h || st != "stall-hang" {
+		t.Errorf("停滞满 stall 且连续探测失败应判 hang;实际 hung=%v state=%s", h, st)
+	}
+
+	// ③ 中途探测成功一次 → 失败计数清零(单次抖动不累积)
+	w3 := newWatcher()
+	w3.setRecheck(func() (float64, bool) { return 1000, true })
+	flaky := true
+	probe := func() bool { flaky = !flaky; return flaky } // 交替 成功/失败
+	w3.step(t0, snap(1000, 1), nil, stall, probe)
+	for i := 1; i <= 10; i++ {
+		w3.step(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, probe)
+	}
+	if w3.probeFails > 1 {
+		t.Errorf("探测成功应把连续失败计数清零,实际 %d", w3.probeFails)
+	}
+	// 即使停滞已远超 stall,只要还能交替探通就不该判 hang
+	w3.step(t0.Add(stall+time.Minute), snap(1000, 1), nil, stall, func() bool { return true })
+	if h, _, _ := w3.Hung(); h {
+		t.Errorf("探测存活时不应判 hang(哪怕停滞已超 stall)")
+	}
+
+	// ④ 被动模式(probe=nil)行为不变:未满 stall 走 freeze-grace
+	w4 := newWatcher()
+	w4.step(t0, snap(1000, 1), nil, stall, nil)
+	w4.step(t0.Add(5*time.Second), snap(1000, 1), nil, stall, nil)
+	if h, st, r := w4.Hung(); h || st != "freeze-grace" {
+		t.Errorf("被动模式未满 stall 应为 freeze-grace;实际 hung=%v state=%s(%s)", h, st, r)
+	}
+}

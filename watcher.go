@@ -129,6 +129,12 @@ type watcher struct {
 
 	// 探测失败后的复核:重新取一次 token_progress。见 step() 里的调用点。
 	recheck func() (float64, bool)
+
+	// 连续探测失败次数。出词 / 探测成功 / 复核发现进度 都会清零。
+	// 只用于日志与测试断言 —— 判死条件仍是 stalledFor >= stall,见 step() 里的说明:
+	// 每轮停滞都探,成功的探测会推进 progress 把停滞计时按回零,所以「停滞累计到 stall」
+	// 本身已经蕴含「这段时间里每次探测都失败」,不需要再拿这个计数器当门槛。
+	probeFails int
 }
 
 // setRecheck:注册「再取一次 token_progress」的回调。主动探测失败后用它复核 ——
@@ -211,12 +217,12 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	}
 	if m.tp > w.lastTP {
 		w.set(false, "growing", "出词 +"+ftoa(m.tp-w.lastTP))
-		w.lastTP, w.lastGrow = m.tp, now
+		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
 		return
 	}
 	if m.tp < w.lastTP {
 		w.set(false, "regress", "计数器倒退(引擎重启过),重置基线")
-		w.lastTP, w.lastGrow = m.tp, now
+		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
 		return
 	}
 	// m.tp == lastTP:停滞
@@ -234,17 +240,35 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 			" 前引擎日志报 hang 特征 → hang(双信号快判)")
 		return
 	}
-	if stalledFor < stall {
-		w.set(false, "freeze-grace", "计数器冻结但 "+dur(stalledFor)+" 前出过词(<stall,视为在干活)")
-		return
-	}
 	stalled := dur(stalledFor)
-	// 冻结超 grace。开了主动探测:无论 running 与否都主动打一下确认 —— 这能抓到 scheduler
-	// 卡死这类「看着空闲(running=0/queue=0)」的 hang(纯被动从指标分不清 wedged 与真空闲)。
-	// 探测本身生成 1 个 token → 健康引擎下轮即 growing、停滞计时自动重置,故对真空闲引擎约每
-	// stall_sec 才探一次,不会每轮骚扰。
+	// 开了主动探测:【每一轮停滞都探】,不再等满 stall_sec 才探第一次。
+	//
+	// 为什么从「满 stall_sec 探一次」改成「每轮都探」(2026-09-14):
+	// 旧行为下,判死链路上只有【一次】探测 —— 停滞满 30s 触发探测,一旦这次探测超时(5s)且复核
+	// 无进度,立刻 hung=true。而 hung 之后 kubelet 的 livenessProbe 只需 2×5s 就会 Killing,
+	// 下一轮 poll(5s)+ 下一次探测(最多 5s)得出的结论恰好和 Killing 同时到达 —— 补救机会形同
+	// 虚设。也就是说:任何一次偶发的 5s 超时(GC、瞬时抖动、一次偏慢的响应)都足以杀掉一台健康引擎。
+	//
+	// 改成每轮都探之后,判死条件不用动就自带了「连续失败」语义:
+	// 探测走 /health_generate,成功时会真跑一次 forward,sglang:realtime_tokens_total 是
+	// metrics_reporter 每个 forward 自增的(与 health_generate 的 log_metrics=False 无关,
+	// 那个只影响 generation_tokens_total),所以【成功的探测会推进 token_progress】→ 下一轮进
+	// growing 分支 → lastGrow 归零。
+	// 于是 stalledFor 能一路累加到 stall_sec,当且仅当这段时间里【每一次探测都失败】。
+	// 30s / 5s ≈ 连败 4 次以上才判死,单次抖动再也杀不死引擎,而判死时机(30s)一点没变。
+	//
+	// ⚠️ 退化情形:旧版 sglang 没有 realtime_tokens_total(progressMetrics 退回 finish-only 的
+	// 四项)时,1-token 的探测不会推进 progress,停滞计时不会被成功的探测按回零。此时行为是
+	// 「每轮探、只要探得通就一直 stall-active-ok」—— 判不出 hang,但也不会误杀;探测一旦真的
+	// 打不通,停滞计时照样累加到 stall_sec 判死。方向是安全的,只是失去了上面那个连败语义。
+	//
+	// 代价:空闲引擎的探测频率从约每 stall_sec 一次变成约每 2 个 poll 一次(探测成功那轮推进
+	// progress,下一轮走 growing 不探,再下一轮才探)。单次探测是 1 个 token 的生成,且
+	// /health_generate 在引擎有活干时会直接返回(只要 detokenizer 最近有任何响应就算存活),
+	// 开销可忽略。有流量时 progress 本来就在涨,根本走不到这里,零新增开销。
 	if probe != nil {
 		if probe() {
+			w.probeFails = 0
 			w.set(false, "stall-active-ok", "token 停滞 "+stalled+"(running="+ftoa(m.running)+"),主动探测存活 → 不判 hang")
 			return
 		}
@@ -255,16 +279,32 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		// 这把「探测超时」从判死的【充分证据】降级成【必要条件之一】。
 		if w.recheck != nil {
 			if tp, ok := w.recheck(); ok && tp > w.lastTP {
+				w.probeFails = 0
 				w.set(false, "probe-fail-but-growing", "token 停滞 "+stalled+"、主动探测失败,但复核发现 progress 已推进 +"+
 					ftoa(tp-w.lastTP)+" → 不判 hang(探测期间引擎恢复了)")
 				w.lastTP, w.lastGrow = tp, now
 				return
 			}
 		}
-		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测失败且复核仍无进度(running="+ftoa(m.running)+")→ hang")
+		w.probeFails++
+		fails := strconv.Itoa(w.probeFails)
+		// 探测失败但停滞还没满 stall_sec:不判死。这正是本次改动的意义所在 ——
+		// 让「探测失败」必须连续发生满 stall_sec 才算数,而不是一次就下手。
+		if stalledFor < stall {
+			w.set(false, "probe-fail-grace", "token 停滞 "+stalled+"、主动探测连续失败 "+fails+
+				" 次(<stall "+dur(stall)+",继续观察)")
+			return
+		}
+		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测连续失败 "+fails+
+			" 次且复核仍无进度(running="+ftoa(m.running)+")→ hang")
 		return
 	}
-	// 纯被动(未开主动探测):只有在途请求还卡着才敢判 hang;running==0 分不清 wedged/空闲 → 放过。
+	// 纯被动(未开主动探测):保持原语义 —— 先等满 stall_sec,再要求 running>0 才敢判 hang;
+	// running==0 分不清 wedged/空闲 → 放过。
+	if stalledFor < stall {
+		w.set(false, "freeze-grace", "计数器冻结但 "+stalled+" 前出过词(<stall,视为在干活)")
+		return
+	}
 	if m.running > 0 {
 		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang(被动)")
 		return
