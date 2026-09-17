@@ -4,6 +4,8 @@
 
 **分工**:sidecar 只【报告】—— 探到 hang 就 `/healthz` 返 503;真正 **kill + 重启由 kubelet 做**(engine 容器 liveness 失败 → 重启该容器;LWS 配 `RecreateGroupOnPodRestart` → 整组重建)。**不调 k8s API、不需要 RBAC。**
 
+本仓由 `inference-production-stack/llm-monitor` 的 `hang-watcher/` 子目录拆分而来,commit 历史已一并带过来;镜像仍是 `harbor.4pd.io/hardcore-tech/hang-watcher:<tag>`,打 tag 触发 CI。
+
 这是 monitor 中心化 auto-restart(`lib/restart.py`/`checks.py`)的 sidecar 化替代:判活逻辑一致,但「杀」交给 k8s、per-pod 判活更准。
 
 ## 判活逻辑(复刻 monitor 的被动短路,不主动打流量)

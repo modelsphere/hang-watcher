@@ -1,0 +1,2 @@
+# 本地 `go build` 产物(与仓名同名,容易误提交)
+/hang-watcher

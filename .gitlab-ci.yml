@@ -1,0 +1,18 @@
+# 打 tag 自动 build hang-watcher 镜像(照 org 惯例,从 llm-monitor 仓拆分时带过来)。
+# org 共享 public-buildx runner:docker daemon 已内置 harbor 鉴权,CI 里不用 docker login。
+# DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(buildkit 的 attestation manifest-list 拉取会卡)。
+# 触发:仅打 git tag。产物:harbor.4pd.io/hardcore-tech/hang-watcher:<tag> (+ :latest)
+stages: [build]
+variables:
+  IMAGE: harbor.4pd.io/hardcore-tech/hang-watcher
+  DOCKER_BUILDKIT: "0"
+
+build:image:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
+    - docker push "$IMAGE:$CI_COMMIT_TAG"
+    - docker push "$IMAGE:latest"
