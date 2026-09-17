@@ -276,7 +276,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	// (block_size=784,一条请求每产 784 个 token 才分配一次,约 10 秒一动),
 	// 所以两条腿是互补关系,谁都不能单独用。
 	if w.haveKVBase && m.haveKV && m.kv > w.lastKV {
-		w.set(false, "kv-growing", "token_progress 平,但 KV 水位 +"+ftoa(m.kv-w.lastKV)+
+		w.set(false, "kv-growing", "token_progress 平,但 KV 水位 +"+gtoa(m.kv-w.lastKV)+
 			"(prefill 在分配 block,视为在干活)")
 		w.lastKV, w.lastGrow, w.probeFails = m.kv, now, 0
 		return
@@ -367,3 +367,9 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 
 func dur(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) + "s" }
 func ftoa(f float64) string      { return strconv.FormatFloat(f, 'f', 0, 64) }
+
+// gtoa:给 0~1 的 gauge(KV 水位)用的格式化。不能复用 ftoa —— 那个是 0 位小数、
+// 为 token 计数设计的,把 KV 的真实增量(实测一个 chunk 约 +0.000861)打成 "+0",
+// 日志读起来成了「没变化却说在干活」,恰好毁掉这条日志的排查价值
+// (2026-09-17 集成测试实拍:"KV 水位 +0")。
+func gtoa(f float64) string { return strconv.FormatFloat(f, 'f', 6, 64) }

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -432,5 +433,29 @@ vllm:num_requests_running{engine="0"} 2`
 sglang:num_running_reqs 1`)
 	if s2.haveKV {
 		t.Error("sglang 文本里不该出现 KV gauge")
+	}
+}
+
+// TestKVDeltaFormatting:KV 增量必须打得出来。
+// 集成测试实拍过 "KV 水位 +0" —— 复用了给 token 计数设计的 0 位小数格式化,
+// 把一个 chunk 的真实增量(约 +0.000861)显示成 0,日志读起来像"没变化却说在干活"。
+func TestKVDeltaFormatting(t *testing.T) {
+	stall := 30 * time.Second
+	t0 := time.Unix(3000, 0)
+	snapKV := func(tp, kv float64) metricsSnap {
+		return metricsSnap{tp: tp, haveTP: true, kv: kv, haveKV: true, running: 1}
+	}
+	w := newWatcher()
+	w.step(t0, snapKV(1000, 0.010000), nil, stall, nil)
+	w.step(t0.Add(5*time.Second), snapKV(1000, 0.010861), nil, stall, nil) // 一个 chunk 的量级
+	_, state, reason := w.Hung()
+	if state != "kv-growing" {
+		t.Fatalf("应走 kv-growing 分支,实际 state=%s reason=%s", state, reason)
+	}
+	if strings.Contains(reason, "+0(") || strings.Contains(reason, "+0 ") {
+		t.Errorf("KV 增量被格式化成了 0,日志无法排查:%s", reason)
+	}
+	if !strings.Contains(reason, "0.000861") {
+		t.Errorf("应显示真实增量 0.000861,实际:%s", reason)
 	}
 }
