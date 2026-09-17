@@ -357,3 +357,80 @@ func TestProbeEveryStalledPoll(t *testing.T) {
 		t.Errorf("被动模式未满 stall 应为 freeze-grace;实际 hung=%v state=%s(%s)", h, st, r)
 	}
 }
+
+// TestKVGaugeCoversPrefill:vLLM 的 prefill 盲区靠 kv_cache_usage_perc 这条腿补上。
+//
+// 背景(2026-09-17 实测):vLLM 侧三个 progress counter 在 prefill 期间全部冻结,
+// 而它又没有 sglang:realtime_tokens_total 的对应物,于是一次长 prefill 会被判成 hang。
+// kv_cache_usage_perc 在 chunked prefill 里逐块爬升,正好覆盖这一段。
+func TestKVGaugeCoversPrefill(t *testing.T) {
+	stall := 30 * time.Second
+	t0 := time.Unix(2000, 0)
+	// tp 恒定 = prefill 期间的真实形态;kv 逐块爬升
+	snapKV := func(tp, kv, running float64) metricsSnap {
+		return metricsSnap{tp: tp, haveTP: true, kv: kv, haveKV: true, running: running}
+	}
+
+	// ① tp 不动但 KV 在涨 -> 视为在干活,停滞计时被重置,久了也不判 hang
+	w := newWatcher()
+	w.step(t0, snapKV(1000, 0.10, 1), nil, stall, nil) // 基线
+	for i := 1; i <= 20; i++ {                         // 100 秒,远超 stall=30s
+		at := t0.Add(time.Duration(i*5) * time.Second)
+		w.step(at, snapKV(1000, 0.10+float64(i)*0.001, 1), nil, stall, nil)
+	}
+	if hung, _, reason := w.Hung(); hung {
+		t.Fatalf("tp 平但 KV 持续上升(prefill 在分配 block)不该判 hang,实际:%s", reason)
+	}
+
+	// ② tp 和 KV 【同时】冻结 -> 真 hang,仍要判出来(这条腿不能把 hang 掩盖掉)
+	w2 := newWatcher()
+	w2.step(t0, snapKV(1000, 0.10, 1), nil, stall, nil)
+	w2.step(t0.Add(stall+time.Second), snapKV(1000, 0.10, 1), nil, stall, nil)
+	if hung, _, _ := w2.Hung(); !hung {
+		t.Fatal("tp 与 KV 同时冻结且 running>0,应判 hang")
+	}
+
+	// ③ KV 【下降】不算进度 —— 引擎卡死后客户端陆续超时断开也会释放 block,
+	//    拿下降当"在干活"会把 hang 掩盖成健康。
+	w3 := newWatcher()
+	w3.step(t0, snapKV(1000, 0.90, 1), nil, stall, nil)
+	for i := 1; i <= 10; i++ { // 50 秒,KV 一路下降
+		at := t0.Add(time.Duration(i*5) * time.Second)
+		w3.step(at, snapKV(1000, 0.90-float64(i)*0.01, 1), nil, stall, nil)
+	}
+	if hung, _, _ := w3.Hung(); !hung {
+		t.Fatal("tp 平 + KV 只降不升,应判 hang(下降不算进度)")
+	}
+
+	// ④ 引擎不暴露该 gauge(sglang)-> 这条腿自动不生效,行为与改动前一致
+	w4 := newWatcher()
+	noKV := func(tp, running float64) metricsSnap {
+		return metricsSnap{tp: tp, haveTP: true, running: running}
+	}
+	w4.step(t0, noKV(1000, 1), nil, stall, nil)
+	w4.step(t0.Add(stall+time.Second), noKV(1000, 1), nil, stall, nil)
+	if hung, _, _ := w4.Hung(); !hung {
+		t.Fatal("没有 KV gauge 时应退回原逻辑:tp 冻结 + running>0 -> hang")
+	}
+}
+
+// TestParseKVGauge:确认 kv_cache_usage_perc 被解析,且跨 DP 多 engine 求和。
+func TestParseKVGauge(t *testing.T) {
+	txt := `vllm:generation_tokens_total{engine="0"} 100
+vllm:kv_cache_usage_perc{engine="0",model_name="m"} 0.25
+vllm:kv_cache_usage_perc{engine="1",model_name="m"} 0.35
+vllm:num_requests_running{engine="0"} 2`
+	s := parseMetrics(txt)
+	if !s.haveKV {
+		t.Fatal("应当解析到 kv_cache_usage_perc")
+	}
+	if s.kv < 0.5999 || s.kv > 0.6001 {
+		t.Errorf("kv 跨 engine 求和应为 0.6,实际 %v", s.kv)
+	}
+	// sglang 没有这个 gauge
+	s2 := parseMetrics(`sglang:generation_tokens_total 5
+sglang:num_running_reqs 1`)
+	if s2.haveKV {
+		t.Error("sglang 文本里不该出现 KV gauge")
+	}
+}

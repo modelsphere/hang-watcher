@@ -55,11 +55,36 @@ var progressMetrics = map[string]bool{
 	"sglang:cuda_graph_passes_total": true,
 }
 
+// kvGaugeMetrics:KV 水位类 gauge,【不能】并进 progressMetrics 求和 —— 那个和被当作
+// 单调计数器用(变小 = 引擎重启过 → 重置基线),而 gauge 请求结束释放 block 时本来就会降,
+// 混进去会被误判成计数器倒退。所以单独跟踪,且【只认上升】,见 step() 里的说明。
+//
+// 为什么 vLLM 需要这条腿(2026-09-17 在 the test cluster / Qwen3.8-27B-FP8 与生产 llm-prod 实测):
+// vLLM 侧三个 progress counter 在【prefill 期间全部冻结】——
+//
+//	generation_tokens_total  decode 逐 step 涨,prefill 不动
+//	prompt_tokens_total      prefill 结束时【一次性入账全长】(生产 1M prompt 实测:
+//	                         连续 10s 不动,然后单个 2s 采样区间里 +1,013,999)
+//	iteration_tokens_total   名字有 iteration,实际按请求产出记(5.6s prefill 里只 +1)
+//
+// 而 vLLM 没有 sglang:realtime_tokens_total / cuda_graph_passes_total 的对应物
+// (实测两套 vLLM 的 88 / 108 个指标里,没有任何含 graph/cuda/forward/step/pass 的)。
+// 于是一次长 prefill 期间 token_progress 是平的,低并发下会被判成 hang。
+//
+// kv_cache_usage_perc 恰好补上这一段:chunked prefill 每块都要分配 KV block,实测它
+// 【逐块匀速爬升】(每 ~0.3s 一个台阶,步长固定 = 一个 chunk 的 block 数),
+// 而同一时间 gen/prompt 纹丝不动。两者正好互补:decode 看 gen,prefill 看 kv。
+var kvGaugeMetrics = map[string]bool{
+	"vllm:kv_cache_usage_perc": true,
+}
+
 // metricsSnap:一轮 /metrics 解析结果。
 type metricsSnap struct {
 	tp      float64 // token_progress(progressMetrics 求和)
 	haveTP  bool    // 是否解析到任一 progress counter
 	running float64 // 在途请求数
+	kv      float64 // KV 水位 gauge(kvGaugeMetrics 求和),prefill 期间的进度信号
+	haveKV  bool    // 是否解析到任一 KV gauge(sglang 侧没有 → false,该腿自动不生效)
 }
 
 // parseMetrics:解析 Prometheus 文本 → token_progress + running。
@@ -89,6 +114,10 @@ func parseMetrics(text string) metricsSnap {
 			s.tp += val
 			s.haveTP = true
 		}
+		if kvGaugeMetrics[name] {
+			s.kv += val // 跨 DP 多 engine 求和,同 tp
+			s.haveKV = true
+		}
 		switch name {
 		case "vllm:num_requests_running":
 			vllmRunning += val // DP 多 engine 求和
@@ -116,6 +145,8 @@ type watcher struct {
 	// 进度跟踪
 	haveBaseline bool
 	lastTP       float64
+	lastKV       float64   // 上一轮的 KV 水位(kvGaugeMetrics 求和),见 kvGaugeMetrics 的说明
+	haveKVBase   bool      // 是否已建 KV 基线(引擎不暴露该 gauge 时恒 false,该腿不生效)
 	lastGrow     time.Time // 上次 token_progress 真增长时刻
 	started      bool      // 拿到过一次成功 /metrics(启动期豁免:未 started 一律健康)
 	firstFail    time.Time // 引擎连续无响应起点(零值=当前可达)
@@ -215,18 +246,44 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	}
 	if !w.haveBaseline {
 		w.haveBaseline, w.lastTP, w.lastGrow = true, m.tp, now
+		w.lastKV, w.haveKVBase = m.kv, m.haveKV
 		w.set(false, "baseline", "建 token_progress 基线")
 		return
 	}
 	if m.tp > w.lastTP {
 		w.set(false, "growing", "出词 +"+ftoa(m.tp-w.lastTP))
 		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
+		w.lastKV, w.haveKVBase = m.kv, m.haveKV
 		return
 	}
 	if m.tp < w.lastTP {
 		w.set(false, "regress", "计数器倒退(引擎重启过),重置基线")
 		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
+		w.lastKV, w.haveKVBase = m.kv, m.haveKV
 		return
+	}
+
+	// token_progress 没动,但 KV 水位【上升】了 → 引擎在 prefill(每个 chunk 都要分配
+	// KV block),同样是在干活。这条腿专治 vLLM 的 prefill 盲区,见 kvGaugeMetrics 的说明。
+	//
+	// 为什么【只认上升】:
+	//   上升 = 新分配 block = 有新算出来的 KV,必然对应真实计算;
+	//   下降 = 请求结束/被 abort 释放 block,这恰恰可能发生在引擎已经卡死、客户端陆续
+	//          超时断开的时候 —— 拿它当「在干活」会把 hang 掩盖成健康。
+	// 所以下降只更新基线、不重置停滞计时,宁可少认一次也不漏判。
+	//
+	// 注意它【不能】替代 progress:实测健康 decode 期间 KV 也是平的
+	// (block_size=784,一条请求每产 784 个 token 才分配一次,约 10 秒一动),
+	// 所以两条腿是互补关系,谁都不能单独用。
+	if w.haveKVBase && m.haveKV && m.kv > w.lastKV {
+		w.set(false, "kv-growing", "token_progress 平,但 KV 水位 +"+ftoa(m.kv-w.lastKV)+
+			"(prefill 在分配 block,视为在干活)")
+		w.lastKV, w.lastGrow, w.probeFails = m.kv, now, 0
+		return
+	}
+	if m.haveKV {
+		// 只更新基线,不重置停滞计时(下降不算进度)
+		w.lastKV, w.haveKVBase = m.kv, true
 	}
 	// m.tp == lastTP:停滞
 	//
