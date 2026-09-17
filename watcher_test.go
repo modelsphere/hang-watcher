@@ -455,7 +455,45 @@ func TestKVDeltaFormatting(t *testing.T) {
 	if strings.Contains(reason, "+0(") || strings.Contains(reason, "+0 ") {
 		t.Errorf("KV 增量被格式化成了 0,日志无法排查:%s", reason)
 	}
+	// 不断言具体字符串 —— gtoa 用 'g' 自适应,不同量级的输出形态不同。
+	// 要保证的是「能看出是个非零的小数」,而不是某个固定写法。
 	if !strings.Contains(reason, "0.000861") {
 		t.Errorf("应显示真实增量 0.000861,实际:%s", reason)
+	}
+}
+
+// TestLogHangBeatsKVGrowing:日志快判必须排在 kv-growing【前面】。
+//
+// 第一版把 kv 分支插在快判之前,于是「prefill 期间 KV 在涨,同时引擎日志已经喊了
+// fatal error」这种双信号组合会被 kv 这一条腿单方面否决掉。快判存在的意义就是
+// 两个独立证据同时成立时提前判,不该被它挡住。code review 时改的,这条测试锁住顺序。
+func TestLogHangBeatsKVGrowing(t *testing.T) {
+	stall := 60 * time.Second
+	t0 := time.Unix(4000, 0)
+	snap := func(tp, kv float64) metricsSnap {
+		return metricsSnap{tp: tp, haveTP: true, kv: kv, haveKV: true, running: 1}
+	}
+	w := newWatcher()
+	w.logEnabled, w.logStall, w.logWindow = true, 15*time.Second, 120*time.Second
+	w.step(t0, snap(1000, 0.10), nil, stall, nil) // 基线
+
+	// 引擎刚喊过特征行,且停滞已超 logStall;同时 KV 还在涨(prefill 在分配 block)
+	w.lastLogHit = t0.Add(18 * time.Second)
+	w.step(t0.Add(20*time.Second), snap(1000, 0.20), nil, stall, nil)
+
+	hung, state, reason := w.Hung()
+	if !hung || state != "stall-hang-log" {
+		t.Fatalf("日志快判应当先于 kv-growing 生效,实际 hung=%v state=%s reason=%s", hung, state, reason)
+	}
+}
+
+// TestKVDeltaAcrossScales:不同部署的 KV 增量量级差几个数量级(= 1/总block数),
+// 格式化必须都能读出来,不能有一个规模打成 0。
+func TestKVDeltaAcrossScales(t *testing.T) {
+	for _, d := range []float64{0.000861, 0.00097, 1.2e-05, 5e-07} {
+		got := gtoa(d)
+		if got == "0" || strings.HasPrefix(got, "0.00000") && !strings.ContainsAny(got, "e123456789") {
+			t.Errorf("增量 %v 被格式化成 %q,日志无法排查", d, got)
+		}
 	}
 }

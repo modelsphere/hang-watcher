@@ -263,28 +263,6 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		return
 	}
 
-	// token_progress 没动,但 KV 水位【上升】了 → 引擎在 prefill(每个 chunk 都要分配
-	// KV block),同样是在干活。这条腿专治 vLLM 的 prefill 盲区,见 kvGaugeMetrics 的说明。
-	//
-	// 为什么【只认上升】:
-	//   上升 = 新分配 block = 有新算出来的 KV,必然对应真实计算;
-	//   下降 = 请求结束/被 abort 释放 block,这恰恰可能发生在引擎已经卡死、客户端陆续
-	//          超时断开的时候 —— 拿它当「在干活」会把 hang 掩盖成健康。
-	// 所以下降只更新基线、不重置停滞计时,宁可少认一次也不漏判。
-	//
-	// 注意它【不能】替代 progress:实测健康 decode 期间 KV 也是平的
-	// (block_size=784,一条请求每产 784 个 token 才分配一次,约 10 秒一动),
-	// 所以两条腿是互补关系,谁都不能单独用。
-	if w.haveKVBase && m.haveKV && m.kv > w.lastKV {
-		w.set(false, "kv-growing", "token_progress 平,但 KV 水位 +"+gtoa(m.kv-w.lastKV)+
-			"(prefill 在分配 block,视为在干活)")
-		w.lastKV, w.lastGrow, w.probeFails = m.kv, now, 0
-		return
-	}
-	if m.haveKV {
-		// 只更新基线,不重置停滞计时(下降不算进度)
-		w.lastKV, w.haveKVBase = m.kv, true
-	}
 	// m.tp == lastTP:停滞
 	//
 	// 【快路径】日志二次确认:两个独立信号同时成立时,不必等满 stall_sec。
@@ -299,6 +277,34 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 			",running="+ftoa(m.running)+")且 "+dur(now.Sub(w.lastLogHit))+
 			" 前引擎日志报 hang 特征 → hang(双信号快判)")
 		return
+	}
+
+	// token_progress 没动,但 KV 水位【上升】了 → 引擎在 prefill(每个 chunk 都要分配
+	// KV block),同样是在干活。这条腿专治 vLLM 的 prefill 盲区,见 kvGaugeMetrics 的说明。
+	//
+	// 为什么【只认上升】:
+	//   上升 = 新分配 block = 有新算出来的 KV,必然对应真实计算;
+	//   下降 = 请求结束/被 abort 释放 block,这恰恰可能发生在引擎已经卡死、客户端陆续
+	//          超时断开的时候 —— 拿它当「在干活」会把 hang 掩盖成健康。
+	// 所以下降只更新基线、不重置停滞计时,宁可少认一次也不漏判。
+	//
+	// 为什么放在【日志快判之后】:快判的意义就是「两个独立信号同时成立时提前判」,
+	// 不该被这一条腿单方面否决。KV 在涨说明调度器还在转、通常不是真 hang,但万一
+	// 引擎已经在日志里喊了 fatal error,那个证据比「还在分配 block」更硬 ——
+	// 让快判先表决。(放在快判之前是第一版的写法,code review 时改的。)
+	//
+	// 注意它【不能】替代 progress:实测健康 decode 期间 KV 也是平的 —— 一条请求要产满
+	// 一个 block 的 token 才会新分配一次,block_size 取决于部署(实测某部署 784,
+	// 按 77 tok/s 算约 10 秒才动一下)。所以两条腿是互补关系,谁都不能单独用。
+	if w.haveKVBase && m.haveKV && m.kv > w.lastKV {
+		w.set(false, "kv-growing", "token_progress 平,但 KV 水位 +"+gtoa(m.kv-w.lastKV)+
+			"(prefill 在分配 block,视为在干活)")
+		w.lastKV, w.lastGrow, w.probeFails = m.kv, now, 0
+		return
+	}
+	if m.haveKV {
+		// 只更新基线,不重置停滞计时(下降不算进度)
+		w.lastKV, w.haveKVBase = m.kv, true
 	}
 	stalled := dur(stalledFor)
 	// 开了主动探测:【每一轮停滞都探】,不再等满 stall_sec 才探第一次。
@@ -368,8 +374,14 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 func dur(d time.Duration) string { return strconv.Itoa(int(d.Seconds())) + "s" }
 func ftoa(f float64) string      { return strconv.FormatFloat(f, 'f', 0, 64) }
 
-// gtoa:给 0~1 的 gauge(KV 水位)用的格式化。不能复用 ftoa —— 那个是 0 位小数、
-// 为 token 计数设计的,把 KV 的真实增量(实测一个 chunk 约 +0.000861)打成 "+0",
+// gtoa:给 0~1 的 gauge(KV 水位)用的格式化。
+//
+// 不能复用 ftoa —— 那个是 0 位小数、为 token 计数设计的,把 KV 的真实增量打成 "+0",
 // 日志读起来成了「没变化却说在干活」,恰好毁掉这条日志的排查价值
 // (2026-09-17 集成测试实拍:"KV 水位 +0")。
-func gtoa(f float64) string { return strconv.FormatFloat(f, 'f', 6, 64) }
+//
+// 用 'g' 而不是定点 6 位小数:增量的量级 = 1/总block数,不同部署差几个数量级
+// (KV 池越大、block 越小,单次分配占比越小)。写死小数位数,在块数很多的部署上
+// 又会打回 "+0.000000" —— 同一个问题换个规模复发。'g' 自适应到 3 位有效数字,
+// 0.000861 和 1.2e-05 都能读。
+func gtoa(f float64) string { return strconv.FormatFloat(f, 'g', 3, 64) }
