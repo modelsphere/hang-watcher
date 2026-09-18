@@ -59,7 +59,7 @@ var progressMetrics = map[string]bool{
 // 单调计数器用(变小 = 引擎重启过 → 重置基线),而 gauge 请求结束释放 block 时本来就会降,
 // 混进去会被误判成计数器倒退。所以单独跟踪,且【只认上升】,见 step() 里的说明。
 //
-// 为什么 vLLM 需要这条腿(2026-09-17 在 the test cluster / Qwen3.8-27B-FP8 与生产 llm-prod 实测):
+// 为什么 vLLM 需要这条腿(2026-09-17 在测试集群 Qwen3.8-27B-FP8 与一套 1M 上下文生产部署上实测):
 // vLLM 侧三个 progress counter 在【prefill 期间全部冻结】——
 //
 //	generation_tokens_total  decode 逐 step 涨,prefill 不动

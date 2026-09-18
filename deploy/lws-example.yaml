@@ -1,0 +1,50 @@
+# Adding hang-watcher to a LeaderWorkerSet (multi-node tensor parallelism).
+# Reference example -- adapt names, ports and image before applying anything.
+#
+# Only the leader needs the sidecar: a wedged worker shows up as frozen
+# token_progress on the leader, and a crashed worker is already visible to
+# Kubernetes. With restartPolicy: RecreateGroupOnPodRestart, restarting the
+# leader container recreates the whole group, which is what a distributed engine
+# needs -- restarting one rank alone would leave the collective broken.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: llm-engine
+  namespace: default
+spec:
+  leaderWorkerTemplate:
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      spec:
+        containers:
+          - name: engine                        # serving on 8000
+            startupProbe:
+              httpGet: { path: /v1/models, port: 8000 }
+              periodSeconds: 15
+              failureThreshold: 80              # 20 min load budget
+              timeoutSeconds: 10
+            livenessProbe:
+              httpGet: { path: /healthz, port: 9090 }
+              periodSeconds: 15
+              failureThreshold: 3               # 45s of 503 before the restart
+          - name: hang-watcher
+            image: ghcr.io/modelhub-org/hang-watcher:latest   # pin a real tag
+            env:
+              - { name: ENGINE_URL,  value: "http://127.0.0.1:8000" }
+              - { name: CONFIG_FILE, value: "/etc/hang-watcher/config.json" }
+              - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+              - { name: POD_NS,   valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+              - { name: LOG_FILE, value: "/var/log/pods/$(POD_NS)_$(POD_NAME)_*/engine/*.log" }
+            ports:
+              - { containerPort: 9090, name: hang-hz }
+            resources:
+              requests: { cpu: "10m",  memory: "16Mi" }
+              limits:   { cpu: "100m", memory: "64Mi" }
+            volumeMounts:
+              - { name: hang-watcher-config, mountPath: /etc/hang-watcher, readOnly: true }
+              - { name: pod-logs, mountPath: /var/log/pods, readOnly: true }
+        volumes:
+          - name: hang-watcher-config
+            configMap: { name: hang-watcher-config }
+          - name: pod-logs
+            hostPath: { path: /var/log/pods, type: Directory }

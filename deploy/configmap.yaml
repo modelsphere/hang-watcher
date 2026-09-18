@@ -1,0 +1,63 @@
+# Liveness parameters for hang-watcher. Hot-reloaded: kubectl apply is enough,
+# the sidecar picks the change up on its next poll and the pod is not rolled.
+# Must live in the same namespace as the engine pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hang-watcher-config
+  namespace: default        # <- the namespace your engine runs in
+data:
+  config.json: |
+    {
+      "poll_interval_sec": 5,
+      "stall_sec": 30,
+      "metrics_timeout_sec": 10,
+      "active_probe_enabled": true,
+      "active_probe_path": "/health_generate",
+      "active_probe_method": "GET",
+      "active_probe_timeout_sec": 5,
+      "log_stall_sec": 30,
+      "log_window_sec": 120
+    }
+    # poll_interval_sec  : how often the engine's /metrics is scraped.
+    # stall_sec          : how long token_progress may stay frozen before the
+    #                      engine is called hung. An engine whose /metrics stays
+    #                      unreachable for this long is also called hung.
+    # metrics_timeout_sec: timeout for a single /metrics scrape.
+    #
+    # active_probe_*     : before declaring a hang, ask the engine directly.
+    #                      /health_generate (sglang) is bounded and cheap; for
+    #                      vLLM use POST /v1/completions with a one-token body.
+    #                      A stalled poll probes every round, so the verdict
+    #                      requires consecutive failures spanning stall_sec -- a
+    #                      single slow probe can no longer kill a healthy engine.
+    #
+    # log_stall_sec      : short stall threshold that applies only when the log
+    #                      agrees. If progress has been frozen this long AND the
+    #                      engine log showed a hang signature within
+    #                      log_window_sec, the hang is declared without waiting
+    #                      out stall_sec. Two independent signals are confidence
+    #                      enough. This ORs with the stall_sec path, so detection
+    #                      only improves: a quiet log still falls back to it.
+    # log_window_sec     : how recent a signature line must be to count.
+    #
+    # The log path and regex are container env vars (LOG_FILE /
+    # LOG_HANG_PATTERN), not ConfigMap keys, because the path has to be built
+    # with the downward API. Leaving LOG_FILE unset disables log confirmation
+    # and falls back to progress-only detection.
+    #
+    # Keep these in sync with whatever else sets them (a Helm chart, say). The
+    # binary's built-in defaults match this file, so running it with no
+    # ConfigMap at all behaves identically.
+    #
+    # Constraint worth respecting: active_probe_timeout_sec + poll_interval_sec
+    # must stay well under stall_sec, otherwise the probe dominates detection
+    # time and the consecutive-failure semantics degrade to a single failure.
+    #
+    # Prerequisite for the log path: the engine must actually emit the line.
+    # On sglang, /health and /health_generate share one handler, and whether it
+    # really generates a token is controlled by an environment variable that
+    # some deployments turn off -- with it off, /health returns empty in
+    # milliseconds, detokenizer-timeout lines never appear on their own, and the
+    # log path can never fire. Turning it on costs about 1s per /health call and
+    # needs a correspondingly looser readiness probe.

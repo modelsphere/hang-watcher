@@ -63,7 +63,7 @@ type hotConfig struct {
 
 func defaultHot() hotConfig {
 	return hotConfig{
-		// 这一组默认值 = 2026-09-08 在测试集群 the test cluster 上用 SIGSTOP 造真 hang、逐项调参
+		// 这一组默认值 = 2026-09-08 在测试集群上用 SIGSTOP 造真 hang、逐项调参
 		// 实测出来的:从 hang 发生到调用方连接被切断 420s+ -> 50s。构成大致是
 		//   stall 30 + poll <=5 + 主动探测 5 + kubelet liveness 2x5 + preStop/退出。
 		// 与 sglang chart 的 hangWatcher.config 默认值保持一致 —— 不挂 ConfigMap 直接跑这个

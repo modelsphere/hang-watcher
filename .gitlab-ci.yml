@@ -1,6 +1,9 @@
-# 打 tag 自动 build hang-watcher 镜像(照 org 惯例,从 llm-monitor 仓拆分时带过来)。
+# 内部 CI:打 tag 自动 build 镜像并推 harbor。开源镜像另说,这份只服务内网。
 # org 共享 public-buildx runner:docker daemon 已内置 harbor 鉴权,CI 里不用 docker login。
-# DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(buildkit 的 attestation manifest-list 拉取会卡)。
+# DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(buildkit 的 attestation
+#   manifest-list 拉取会卡)。
+# Dockerfile 的基座默认是 docker.io(给外部用户),这里用 build-arg 指回 harbor 上的
+#   镜像 —— runner 拉 docker.io 不稳,而且内部构建本来就该走内网基座。
 # 触发:仅打 git tag。产物:harbor.4pd.io/hardcore-tech/hang-watcher:<tag> (+ :latest)
 stages: [build]
 variables:
@@ -13,6 +16,9 @@ build:image:
   rules:
     - if: '$CI_COMMIT_TAG'
   script:
-    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
+    - docker build
+        --build-arg GO_IMAGE=harbor.4pd.io/hardcore-tech/golang:1.24-bookworm
+        --build-arg RUNTIME_IMAGE=harbor.4pd.io/hardcore-tech/debian:12-slim
+        -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
     - docker push "$IMAGE:latest"
