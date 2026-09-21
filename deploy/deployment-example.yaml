@@ -34,7 +34,7 @@ spec:
 
         # 3. the sidecar
         - name: hang-watcher
-          image: ghcr.io/modelhub-org/hang-watcher:latest   # pin a real tag
+          image: 4pdosc/hang-watcher:0.1.22   # pin a real tag
           env:
             - { name: ENGINE_URL,  value: "http://127.0.0.1:8000" }
             - { name: CONFIG_FILE, value: "/etc/hang-watcher/config.json" }
