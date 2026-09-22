@@ -1,3 +1,3 @@
-module github.com/project-modelpilot/hang-watcher
+module github.com/modelsphere/hang-watcher
 
 go 1.24
