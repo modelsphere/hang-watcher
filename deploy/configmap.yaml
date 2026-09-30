@@ -17,6 +17,15 @@ data:
   #                      engine is called hung. An engine whose /metrics stays
   #                      unreachable for this long is also called hung.
   # metrics_timeout_sec: timeout for a single /metrics scrape.
+  # warmup_sec         : grace period after the engine first serves /metrics.
+  #                      Verdicts are still computed and logged during it (with
+  #                      a warmup- state prefix) but do not reach /healthz, so
+  #                      nothing is restarted. The first minutes are when a
+  #                      healthy engine is least likely to look healthy -- cuda
+  #                      graph capture, the first long prefills, the KV pool
+  #                      filling out -- while a restart costs a full model load.
+  #                      Re-armed when the engine restarts (counters go
+  #                      backwards). Set 1 to effectively disable.
   #
   # active_probe_*     : before declaring a hang, ask the engine directly.
   #                      /health_generate (sglang) is bounded and cheap; for
@@ -59,6 +68,7 @@ data:
       "poll_interval_sec": 5,
       "stall_sec": 30,
       "metrics_timeout_sec": 10,
+      "warmup_sec": 600,
       "active_probe_enabled": true,
       "active_probe_path": "/health_generate",
       "active_probe_method": "GET",

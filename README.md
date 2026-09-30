@@ -41,6 +41,9 @@ Every poll scrapes `/metrics` and evaluates, in priority order:
    configured → idle, healthy. A quiet night must not look like a hang.
 7. **Startup exemption** — before `/metrics` has ever been scraped
    successfully, always healthy. Model loading is the startupProbe's job.
+8. **Warm-up grace** — for `warmup_sec` after the engine first became ready,
+   every verdict above is still computed and logged but **not acted on**:
+   `/healthz` stays 200. See below.
 
 ### The two engine-specific blind spots
 
@@ -125,6 +128,7 @@ needs one.
 | `poll_interval_sec` | 5 | `/metrics` scrape period |
 | `stall_sec` | 30 | how long progress may stay frozen before a hang is declared |
 | `metrics_timeout_sec` | 10 | `/metrics` scrape timeout |
+| `warmup_sec` | 600 | grace period after ready during which hangs are logged, not acted on |
 | `active_probe_enabled` | `true` | ask the engine before declaring a hang |
 | `active_probe_path` | `/health_generate` | probe path; for vLLM use `/v1/completions` |
 | `active_probe_method` | `GET` | `GET` or `POST` |
@@ -144,6 +148,36 @@ hang to the caller's connection being cut from over 420 seconds down to about
 built-in defaults, `deploy/configmap.yaml` and any chart that ships this sidecar
 should agree, so that running the binary with no ConfigMap behaves like a full
 deployment.
+
+### Why a warm-up grace period
+
+A restart is not cheap: the engine has to load the model again, which for a
+large one is tens of minutes. That cost has to be weighed against detecting a
+hang a few minutes earlier, and in the first minutes after readiness the balance
+is clearly on the side of waiting.
+
+Those minutes are also when a healthy engine is least likely to look healthy.
+`/metrics` becomes reachable as soon as the HTTP server is up, but cuda graph
+capture, the first long prefills and the KV pool filling out all come after
+that, and any of them can freeze `token_progress` past `stall_sec`.
+
+Measured on kimi-k3 (2026-09-30): first `/metrics` at 12:40:38, the log fast
+path declared a hang at 12:44:18, and the container was killed — three minutes
+and forty seconds of life, paid for with a 27-minute reload. Nothing was wrong
+with the detection; the verdict was simply acted on too early.
+
+During the grace period the state machine keeps running and a suppressed verdict
+is logged in full, prefixed `warmup-`. That matters: a grace period that hid the
+evidence would turn a real fault into silence. Readiness is unaffected — the
+engine's own readinessProbe still takes a wedged pod out of the endpoints, so a
+genuinely dead engine stops receiving traffic either way. The grace period only
+defers the **restart**.
+
+The clock restarts when the engine does, detected by its token counters going
+backwards. A brief scrape failure does **not** restart it: `firstFail` is set by
+a single failed scrape, so treating a recovery as a restart would let an engine
+that flaps every nine minutes renew the grace period forever and never be
+declared hung.
 
 ## Deployment
 

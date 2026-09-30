@@ -6,6 +6,19 @@ was carried over, but the release tags were not.
 
 ## Unreleased
 
+- **Warm-up grace period after readiness (`warmup_sec`, default 600).** For ten
+  minutes after the engine first serves `/metrics`, hang verdicts are computed
+  and logged but not acted on. The first minutes are when a healthy engine is
+  least likely to look healthy — cuda graph capture, the first long prefills and
+  the KV pool filling out can each freeze `token_progress` past `stall_sec` —
+  while a restart costs a full model load. Measured on kimi-k3 (2026-09-30): the
+  engine was killed 3m40s after becoming ready, for a 27-minute reload.
+  Suppressed verdicts are logged with a `warmup-` state prefix so the grace
+  period cannot hide a real fault. The clock re-arms when the engine restarts
+  (token counters go backwards), but deliberately **not** on recovery from a
+  brief scrape failure, which would let a flapping engine renew it forever.
+  All four verdict paths now route through one function, so the grace period
+  cannot be half-applied.
 - **Fixed: the example ConfigMap's settings never applied.** Its explanatory
   comments were indented into the `config.json: |` block scalar, making them part
   of the value; Go rejects anything after a top-level JSON value, so the sidecar

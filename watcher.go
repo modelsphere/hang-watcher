@@ -151,6 +151,11 @@ type watcher struct {
 	started      bool      // 拿到过一次成功 /metrics(启动期豁免:未 started 一律健康)
 	firstFail    time.Time // 引擎连续无响应起点(零值=当前可达)
 
+	// Warm-up grace period. A zero readyAt means the engine has never been
+	// ready; warmup is refreshed from config each poll, see the top of step().
+	readyAt time.Time
+	warmup  time.Duration
+
 	// 日志二次确认(可选,log_file 配了才启用)。见 logtail.go 的说明。
 	logEnabled bool          // 配了日志通道
 	logWindow  time.Duration // 特征行「算数」的时效窗
@@ -206,6 +211,36 @@ func (w *watcher) set(hung bool, state, reason string) {
 	w.mu.Unlock()
 }
 
+// setHang is the single exit for EVERY hang verdict. Within warmup seconds of
+// becoming ready, a verdict is downgraded to healthy.
+//
+// Why one exit rather than an `if` at each site: there are four paths to a hang
+// (unreachable, log fast path, probe failure, passive stall). Missing one would
+// leave a grace period that works almost all the time, which is the hardest
+// kind of gap to notice.
+//
+// Why unreach-hang is covered too: a brief /metrics outage right after
+// readiness is normal -- cuda graph capture and the first requests can both tie
+// up the HTTP thread. A genuinely dead engine is still handled: readiness probes
+// the engine's own endpoint, not this one, so it leaves the endpoints either
+// way. Only the restart is deferred.
+//
+// A suppressed verdict MUST still be logged. Otherwise the grace period would
+// swallow a real fault and leave nothing to find. The warmup- state prefix keeps
+// main.go's state-change dedup working and makes it obvious the engine was not
+// actually healthy.
+func (w *watcher) setHang(now time.Time, state, reason string) {
+	if w.warmup > 0 && !w.readyAt.IsZero() {
+		if left := w.warmup - now.Sub(w.readyAt); left > 0 {
+			w.set(false, "warmup-"+state, "warm-up grace: would have declared a hang ("+reason+
+				") but the engine has only been ready for "+dur(now.Sub(w.readyAt))+
+				"; not acting for another "+dur(left))
+			return
+		}
+	}
+	w.set(true, state, reason)
+}
+
 // Hung:当前裁决(供 /healthz)。返回 是否 hang / 粗状态(去重用)/ 详细原因。
 func (w *watcher) Hung() (bool, string, string) {
 	w.mu.RLock()
@@ -216,10 +251,18 @@ func (w *watcher) Hung() (bool, string, string) {
 // step:处理一轮 poll 结果。fetchErr!=nil 表示 /metrics 拉不到。stall 是停滞判 hang 的阈值。
 // 未 started(启动期,还没成功拉到过 metrics)→ 一律健康,交给 startupProbe 兜启动。
 //
+// warmup is the grace period after readiness, during which every hang verdict
+// is recorded but not acted on (see setHang). It is taken from config on each
+// call rather than stored on the watcher: logStall was captured at startup, so
+// a hot reload changed only the log line and not the behaviour -- operators read
+// "config reloaded" and believed it had taken effect (see the hot-reload branch
+// in main.go). Passing it as a parameter avoids that trap by construction.
+//
 // probe 是【可选】的主动探测(nil=关):仅在被动逻辑将判 stall-hang 时调用 —— 主动打一下引擎
 // (如 GET /health_generate),通了就认为引擎仍存活、不判 hang(对齐 monitor 的『杀前确认』,减少
 // running>0 停滞的误杀);打不通才坐实 hang。其它分支(空闲/不可达/出词)不触发,不额外加载。
-func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.Duration, probe func() bool) {
+func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall, warmup time.Duration, probe func() bool) {
+	w.warmup = warmup
 	if fetchErr != nil {
 		if !w.started {
 			w.set(false, "startup", "启动中:/metrics 暂不可达(startupProbe 兜)")
@@ -232,12 +275,15 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		// 前后两段拼在一起,读起来像是一直在失败。
 		w.probeFails = 0
 		if now.Sub(w.firstFail) >= stall {
-			w.set(true, "unreach-hang", "引擎 /metrics 持续无响应 "+dur(now.Sub(w.firstFail)))
+			w.setHang(now, "unreach-hang", "引擎 /metrics 持续无响应 "+dur(now.Sub(w.firstFail)))
 		} // 未超 stall:保持上次裁决(短暂抖动不误杀)
 		return
 	}
 	w.firstFail = time.Time{}
-	w.started = true
+	if !w.started {
+		w.started = true
+		w.readyAt = now // first successful scrape = ready; the grace period starts here
+	}
 
 	if !m.haveTP {
 		// 无 progress 计数(旧引擎/未开 metrics):无法按进度判活 → 健康,靠 readiness/health 兜
@@ -257,9 +303,20 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		return
 	}
 	if m.tp < w.lastTP {
-		w.set(false, "regress", "计数器倒退(引擎重启过),重置基线")
+		// Counters going backwards means the engine process was replaced. The new
+		// one reloads the model, captures cuda graphs and serves its first
+		// requests -- no different from a first start -- so the grace period is
+		// re-armed with it.
+		//
+		// Why only this signal, and not recovery from an outage: firstFail is set
+		// by a single failed scrape, so treating a recovery as a restart would let
+		// an engine that flaps every nine minutes renew the grace period forever
+		// and never be declared hung. A counter reset is hard evidence of a new
+		// process; a flap is not.
+		w.set(false, "regress", "计数器倒退(引擎重启过),重置基线与 warmup")
 		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
 		w.lastKV, w.haveKVBase = m.kv, m.haveKV
+		w.readyAt = now
 		return
 	}
 
@@ -273,7 +330,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 	stalledFor := now.Sub(w.lastGrow)
 	if w.logEnabled && !w.logBroken && stalledFor >= w.logStall &&
 		!w.lastLogHit.IsZero() && now.Sub(w.lastLogHit) <= w.logWindow {
-		w.set(true, "stall-hang-log", "token 停滞 "+dur(stalledFor)+"(>=log_stall "+dur(w.logStall)+
+		w.setHang(now, "stall-hang-log", "token 停滞 "+dur(stalledFor)+"(>=log_stall "+dur(w.logStall)+
 			",running="+ftoa(m.running)+")且 "+dur(now.Sub(w.lastLogHit))+
 			" 前引擎日志报 hang 特征 → hang(双信号快判)")
 		return
@@ -354,7 +411,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 				" 次(<stall "+dur(stall)+",继续观察)")
 			return
 		}
-		w.set(true, "stall-hang", "token 停滞 "+stalled+"、主动探测连续失败 "+fails+
+		w.setHang(now, "stall-hang", "token 停滞 "+stalled+"、主动探测连续失败 "+fails+
 			" 次且复核仍无进度(running="+ftoa(m.running)+")→ hang")
 		return
 	}
@@ -365,7 +422,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall time.
 		return
 	}
 	if m.running > 0 {
-		w.set(true, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang(被动)")
+		w.setHang(now, "stall-hang", "token 停滞 "+stalled+" 且 running="+ftoa(m.running)+">0 → hang(被动)")
 		return
 	}
 	w.set(false, "idle", "空闲(running=0,停滞不算 hang;wedged-idle 靠日志快判或 active_probe 覆盖)")
