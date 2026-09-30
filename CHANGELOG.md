@@ -6,6 +6,12 @@ was carried over, but the release tags were not.
 
 ## Unreleased
 
+- **Fixed: the example ConfigMap's settings never applied.** Its explanatory
+  comments were indented into the `config.json: |` block scalar, making them part
+  of the value; Go rejects anything after a top-level JSON value, so the sidecar
+  logged a parse failure and fell back to its built-in defaults with every key
+  ignored. This went unnoticed because those defaults match what the file says.
+  The comments are now YAML comments outside the block.
 - Split into a standalone repository. The image name and the configuration are
   unchanged.
 - Base images in the `Dockerfile` are now public (`docker.io/library/...`) and
