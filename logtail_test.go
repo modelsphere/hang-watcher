@@ -164,7 +164,7 @@ func TestLogConfirm(t *testing.T) {
 	newW := func() *watcher {
 		w := newWatcher()
 		w.enableLogConfirm(logStall, window)
-		w.step(t0, snap(1000, 1), nil, stall, nil) // 基线
+		w.stepNoWarmup(t0, snap(1000, 1), nil, stall, nil) // 基线
 		return w
 	}
 	// 关键时刻:停滞 40s —— 已过 log_stall(30s),但远没到 stall_sec(180s)
@@ -174,7 +174,7 @@ func TestLogConfirm(t *testing.T) {
 	// ① 核心诉求:停滞 40s + 日志喊了 → 立刻判 hang(不等 180s)
 	w := newW()
 	w.noteLogHits(fast.Add(-10*time.Second), 1, nil)
-	w.step(fast, snap(1000, 1), nil, stall, nil)
+	w.stepNoWarmup(fast, snap(1000, 1), nil, stall, nil)
 	if h, st, r := w.Hung(); !h || st != "stall-hang-log" {
 		t.Errorf("停滞 40s + 日志特征应快判 hang,实际 hung=%v state=%s(%s)", h, st, r)
 	}
@@ -183,7 +183,7 @@ func TestLogConfirm(t *testing.T) {
 	early := t0.Add(20 * time.Second)
 	w2 := newW()
 	w2.noteLogHits(early, 1, nil)
-	w2.step(early, snap(1000, 1), nil, stall, nil)
+	w2.stepNoWarmup(early, snap(1000, 1), nil, stall, nil)
 	if h, st, _ := w2.Hung(); h || st != "freeze-grace" {
 		t.Errorf("停滞 20s < log_stall 30s 不应判 hang,实际 hung=%v state=%s", h, st)
 	}
@@ -191,7 +191,7 @@ func TestLogConfirm(t *testing.T) {
 	// ③ 停滞 40s 但日志没喊 → 走老路径,还没到 180s → 健康(不比现状差,也不更激进)
 	w3 := newW()
 	w3.noteLogHits(fast, 0, nil)
-	w3.step(fast, snap(1000, 1), nil, stall, nil)
+	w3.stepNoWarmup(fast, snap(1000, 1), nil, stall, nil)
 	if h, st, _ := w3.Hung(); h || st != "freeze-grace" {
 		t.Errorf("无日志佐证时 40s 不应判 hang(等 stall_sec),实际 hung=%v state=%s", h, st)
 	}
@@ -199,7 +199,7 @@ func TestLogConfirm(t *testing.T) {
 	// ④ 没有日志佐证但停滞满 180s → 老路径照常判 hang(能力只增不减)
 	w4 := newW()
 	w4.noteLogHits(slow, 0, nil)
-	w4.step(slow, snap(1000, 1), nil, stall, nil)
+	w4.stepNoWarmup(slow, snap(1000, 1), nil, stall, nil)
 	if h, st, r := w4.Hung(); !h || st != "stall-hang" {
 		t.Errorf("停滞满 stall_sec 应按老路径判 hang,实际 hung=%v state=%s(%s)", h, st, r)
 	}
@@ -207,7 +207,7 @@ func TestLogConfirm(t *testing.T) {
 	// ⑤ 日志特征太老(超出 window)→ 不给快判资格,退回老路径
 	w5 := newW()
 	w5.noteLogHits(fast.Add(-(window + time.Minute)), 1, nil)
-	w5.step(fast, snap(1000, 1), nil, stall, nil)
+	w5.stepNoWarmup(fast, snap(1000, 1), nil, stall, nil)
 	if h, _, _ := w5.Hung(); h {
 		t.Errorf("过期的日志特征不应触发快判")
 	}
@@ -215,7 +215,7 @@ func TestLogConfirm(t *testing.T) {
 	// ⑥ 日志喊了但 progress 还在涨 → 健康(日志不是充分条件,单条 health 超时不杀)
 	w6 := newW()
 	w6.noteLogHits(t0.Add(10*time.Second), 3, nil)
-	w6.step(t0.Add(15*time.Second), snap(2000, 1), nil, stall, nil)
+	w6.stepNoWarmup(t0.Add(15*time.Second), snap(2000, 1), nil, stall, nil)
 	if h, st, _ := w6.Hung(); h || st != "growing" {
 		t.Errorf("progress 在涨时日志不应触发 hang,实际 hung=%v state=%s", h, st)
 	}
@@ -223,12 +223,12 @@ func TestLogConfirm(t *testing.T) {
 	// ⑦ 日志通道坏了 → 不快判,但老路径照常(不漏杀)
 	w7 := newW()
 	w7.noteLogHits(fast, 1, errors.New("no such file"))
-	w7.step(fast, snap(1000, 1), nil, stall, nil)
+	w7.stepNoWarmup(fast, snap(1000, 1), nil, stall, nil)
 	if h, _, _ := w7.Hung(); h {
 		t.Errorf("日志通道不可用时不应快判(证据不可信)")
 	}
 	w7.noteLogHits(slow, 1, errors.New("no such file"))
-	w7.step(slow, snap(1000, 1), nil, stall, nil)
+	w7.stepNoWarmup(slow, snap(1000, 1), nil, stall, nil)
 	if h, _, r := w7.Hung(); !h {
 		t.Errorf("日志通道不可用但停滞满 stall_sec,应按老路径判 hang,实际健康(%s)", r)
 	}
@@ -238,7 +238,7 @@ func TestLogConfirm(t *testing.T) {
 	//    日志正好补上这个盲区:真空闲的引擎 /health 是通的、不会打这行。
 	w8 := newW()
 	w8.noteLogHits(fast, 5, nil)
-	w8.step(fast, snap(1000, 0), nil, stall, nil)
+	w8.stepNoWarmup(fast, snap(1000, 0), nil, stall, nil)
 	if h, _, r := w8.Hung(); !h {
 		t.Errorf("wedged-idle(running=0 但日志报 detokenizer 超时)应判 hang,实际健康(%s)", r)
 	}
@@ -246,7 +246,7 @@ func TestLogConfirm(t *testing.T) {
 	// ⑨ 真空闲:running==0 且日志没喊 → 放过(不误杀半夜无流量)
 	w9 := newW()
 	w9.noteLogHits(slow, 0, nil)
-	w9.step(slow, snap(1000, 0), nil, stall, nil)
+	w9.stepNoWarmup(slow, snap(1000, 0), nil, stall, nil)
 	if h, _, _ := w9.Hung(); h {
 		t.Errorf("真空闲(running=0 且无日志特征)不应判 hang")
 	}

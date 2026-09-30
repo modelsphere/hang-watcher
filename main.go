@@ -43,6 +43,11 @@ type hotConfig struct {
 	StallSec          int `json:"stall_sec"`           // token 停滞多久(且 running>0)判 hang
 	MetricsTimeoutSec int `json:"metrics_timeout_sec"` // 拉 /metrics 超时
 
+	// Grace period after the engine first serves /metrics: for this many seconds
+	// a hang is logged but not acted on. Re-armed when the engine restarts (token
+	// counters go backwards). Set 1 to effectively disable.
+	WarmupSec int `json:"warmup_sec"`
+
 	// 日志快判(可选,默认关):配了 log_file 才启用。progress 停滞 >= log_stall_sec(默认 30s)
 	// 【且】引擎日志最近 log_window_sec 内出现过 log_hang_pattern → 直接判 hang,不必等满
 	// stall_sec(60s)。两个独立信号叠加,置信度够,判定更快。
@@ -71,10 +76,18 @@ func defaultHot() hotConfig {
 		PollIntervalSec:   envInt("POLL_INTERVAL_SEC", 5),
 		StallSec:          envInt("STALL_SEC", 30),
 		MetricsTimeoutSec: envInt("METRICS_TIMEOUT_SEC", 10),
-		LogFile:           envOr("LOG_FILE", ""),
-		LogHangPattern:    envOr("LOG_HANG_PATTERN", ""),
-		LogWindowSec:      envInt("LOG_WINDOW_SEC", 120),
-		LogStallSec:       envInt("LOG_STALL_SEC", 30),
+		// 600s: the first minutes after readiness are still warm-up -- cuda graph
+		// capture, the first long prefills, the KV pool filling out -- and a stall
+		// there does not mean a hang. Measured on kimi-k3 (2026-09-30): first
+		// /metrics at 12:40:38, killed by the log fast path at 12:44:18. Three
+		// minutes forty of life for a ~27-minute reload. Missing a hang during
+		// these ten minutes is the cheaper mistake: readiness still takes the pod
+		// out of the endpoints, only the restart waits.
+		WarmupSec:      envInt("WARMUP_SEC", 600),
+		LogFile:        envOr("LOG_FILE", ""),
+		LogHangPattern: envOr("LOG_HANG_PATTERN", ""),
+		LogWindowSec:   envInt("LOG_WINDOW_SEC", 120),
+		LogStallSec:    envInt("LOG_STALL_SEC", 30),
 		// 主动探测默认【开】(此前默认关)。纯被动路径分不清「真空闲」和「调度器卡死导致
 		// 没有在途请求」—— 两种情况 running 都是 0,wedged-idle 只能靠它兜。
 		// 端点用 /health_generate 而非 /v1/completions:两者都走到 scheduler,但前者有界 ——
@@ -108,6 +121,14 @@ func loadHot(path string, base hotConfig) hotConfig {
 	}
 	if cur.MetricsTimeoutSec <= 0 {
 		cur.MetricsTimeoutSec = base.MetricsTimeoutSec
+	}
+	// A missing key (an older ConfigMap, or helm --reuse-values) renders as 0, so
+	// fall back to the default rather than to "no grace". The direction is
+	// deliberate: a missed hang costs one instance staying down a while longer,
+	// whereas killing during warm-up costs another full model load and can loop.
+	// Write 1 to actually disable it.
+	if cur.WarmupSec <= 0 {
+		cur.WarmupSec = base.WarmupSec
 	}
 	if cur.ActiveProbePath == "" {
 		cur.ActiveProbePath = base.ActiveProbePath
@@ -208,7 +229,7 @@ func main() {
 	if fi, err := os.Stat(configFile); err == nil {
 		lastMtime = fi.ModTime() // 预置:首轮不再冗余重读,「热更」日志只在真改动时出
 	}
-	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot), logDesc(hot))
+	log.Printf("初始配置:poll=%ds stall=%ds timeout=%ds warmup=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, hot.WarmupSec, probeDesc(hot), logDesc(hot))
 
 	// 日志二次确认(log_file 配了才启)。pattern/路径是启动期固定的,不参与热更 ——
 	// 换路径要滚 pod;窗口 log_window_sec 也在启动时定,想热调再说(改一行即可)。
@@ -243,7 +264,7 @@ func main() {
 		if fi, err := os.Stat(configFile); err == nil && fi.ModTime() != lastMtime {
 			lastMtime = fi.ModTime()
 			hot = loadHot(configFile, defaults)
-			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, probeDesc(hot), logDesc(hot))
+			log.Printf("配置热更:poll=%ds stall=%ds timeout=%ds warmup=%ds 主动探测=%s 日志确认=%s", hot.PollIntervalSec, hot.StallSec, hot.MetricsTimeoutSec, hot.WarmupSec, probeDesc(hot), logDesc(hot))
 			// 这两个值是启动时捕获进 watcher 的,不像其它配置那样每轮从 hot 现取 ——
 			// 不在这里重新灌一遍,改 ConfigMap 就只会改变上面那行日志、不改变行为,
 			// 运维看着"配置热更"以为生效了其实没有。log_file / log_hang_pattern 确实
@@ -278,7 +299,8 @@ func main() {
 		if err == nil {
 			snap = parseMetrics(text)
 		}
-		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second, makeActiveProbe(client, engineURL, hot))
+		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second,
+			time.Duration(hot.WarmupSec)*time.Second, makeActiveProbe(client, engineURL, hot))
 
 		if hung, state, reason := w.Hung(); state != lastState { // 粗状态变化才打日志(reason 内数字每轮变,按 state 去重免刷屏)
 			lastState = state

@@ -96,47 +96,47 @@ func TestWatcherVerdict(t *testing.T) {
 
 	// ① 启动期:/metrics 不可达 → 不判 hang(交给 startupProbe)
 	w := newWatcher()
-	w.step(t0, metricsSnap{}, errors.New("conn refused"), stall, nil)
+	w.stepNoWarmup(t0, metricsSnap{}, errors.New("conn refused"), stall, nil)
 	if h, _, _ := w.Hung(); h {
 		t.Errorf("启动期不可达不应判 hang")
 	}
 
 	// ② 建基线 → 健康
-	w.step(t0, snap(1000, 2), nil, stall, nil)
+	w.stepNoWarmup(t0, snap(1000, 2), nil, stall, nil)
 	if h, _, _ := w.Hung(); h {
 		t.Errorf("建基线应健康")
 	}
 
 	// ③ 出词增长 → 健康
-	w.step(t0.Add(15*time.Second), snap(1500, 2), nil, stall, nil)
+	w.stepNoWarmup(t0.Add(15*time.Second), snap(1500, 2), nil, stall, nil)
 	if h, _, _ := w.Hung(); h {
 		t.Errorf("出词增长应健康")
 	}
 
 	// ④ 停滞但未超 stall → 健康(冻结宽限)
-	w.step(t0.Add(120*time.Second), snap(1500, 2), nil, stall, nil)
+	w.stepNoWarmup(t0.Add(120*time.Second), snap(1500, 2), nil, stall, nil)
 	if h, _, _ := w.Hung(); h {
 		t.Errorf("停滞 105s<stall 应健康(宽限)")
 	}
 
 	// ⑤ 停滞超 stall 且 running>0 → HANG
-	w.step(t0.Add(15*time.Second+stall+time.Second), snap(1500, 2), nil, stall, nil)
+	w.stepNoWarmup(t0.Add(15*time.Second+stall+time.Second), snap(1500, 2), nil, stall, nil)
 	if h, _, r := w.Hung(); !h {
 		t.Errorf("停滞超 stall + running>0 应判 hang,实际 healthy(%s)", r)
 	}
 
 	// ⑥ 空闲豁免:停滞超 stall 但 running==0 → 健康
 	w2 := newWatcher()
-	w2.step(t0, snap(1000, 0), nil, stall, nil)                        // 基线
-	w2.step(t0.Add(stall+time.Minute), snap(1000, 0), nil, stall, nil) // 长期停滞 running=0
+	w2.stepNoWarmup(t0, snap(1000, 0), nil, stall, nil)                        // 基线
+	w2.stepNoWarmup(t0.Add(stall+time.Minute), snap(1000, 0), nil, stall, nil) // 长期停滞 running=0
 	if h, _, _ := w2.Hung(); h {
 		t.Errorf("空闲(running=0)停滞不应判 hang")
 	}
 
 	// ⑦ 计数器倒退(引擎重启)→ 重置基线、健康
 	w3 := newWatcher()
-	w3.step(t0, snap(5000, 1), nil, stall, nil)
-	w3.step(t0.Add(15*time.Second), snap(10, 1), nil, stall, nil) // 倒退
+	w3.stepNoWarmup(t0, snap(5000, 1), nil, stall, nil)
+	w3.stepNoWarmup(t0.Add(15*time.Second), snap(10, 1), nil, stall, nil) // 倒退
 	if h, _, _ := w3.Hung(); h {
 		t.Errorf("计数器倒退应重置基线、健康")
 	}
@@ -153,10 +153,10 @@ func TestWatcherVerdict(t *testing.T) {
 			"sglang:realtime_tokens_total{mode=\"decode\"} %d\n"+
 			"sglang:num_running_reqs 1\n", rt)
 	}
-	w3b.step(t0, parseMetrics(text(realtime)), nil, stall, nil) // 基线
-	for i := 1; i <= 12; i++ {                                  // 12×30s = 360s > stall
+	w3b.stepNoWarmup(t0, parseMetrics(text(realtime)), nil, stall, nil) // 基线
+	for i := 1; i <= 12; i++ {                                          // 12×30s = 360s > stall
 		realtime += 40 // 每轮 decode iteration 推进
-		w3b.step(t0.Add(time.Duration(i)*30*time.Second), parseMetrics(text(realtime)), nil, stall, nil)
+		w3b.stepNoWarmup(t0.Add(time.Duration(i)*30*time.Second), parseMetrics(text(realtime)), nil, stall, nil)
 	}
 	if h, _, r := w3b.Hung(); h {
 		t.Errorf("长请求(仅 realtime 在涨)不应判 hang,实际 hang(%s)", r)
@@ -164,12 +164,12 @@ func TestWatcherVerdict(t *testing.T) {
 
 	// ⑧ started 后持续不可达超 stall → HANG(引擎 HTTP 层死)
 	w4 := newWatcher()
-	w4.step(t0, snap(1000, 1), nil, stall, nil)                                 // started
-	w4.step(t0.Add(10*time.Second), metricsSnap{}, errors.New("x"), stall, nil) // firstFail
+	w4.stepNoWarmup(t0, snap(1000, 1), nil, stall, nil)                                 // started
+	w4.stepNoWarmup(t0.Add(10*time.Second), metricsSnap{}, errors.New("x"), stall, nil) // firstFail
 	if h, _, _ := w4.Hung(); h {
 		t.Errorf("刚不可达(未超 stall)不应立刻 hang")
 	}
-	w4.step(t0.Add(10*time.Second+stall+time.Second), metricsSnap{}, errors.New("x"), stall, nil)
+	w4.stepNoWarmup(t0.Add(10*time.Second+stall+time.Second), metricsSnap{}, errors.New("x"), stall, nil)
 	if h, _, r := w4.Hung(); !h {
 		t.Errorf("持续不可达超 stall 应判 hang,实际(%s)", r)
 	}
@@ -183,16 +183,16 @@ func TestActiveProbe(t *testing.T) {
 
 	// 探测返回 true(引擎仍存活)→ 停滞超 stall + running>0 也不判 hang
 	wOK := newWatcher()
-	wOK.step(t0, snap(1000, 2), nil, stall, nil) // 基线
-	wOK.step(t0.Add(stall+time.Second), snap(1000, 2), nil, stall, func() bool { return true })
+	wOK.stepNoWarmup(t0, snap(1000, 2), nil, stall, nil) // 基线
+	wOK.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 2), nil, stall, func() bool { return true })
 	if h, s, _ := wOK.Hung(); h || s != "stall-active-ok" {
 		t.Errorf("主动探测通过应不判 hang,得 hung=%v state=%s", h, s)
 	}
 
 	// 探测返回 false(引擎打不通)→ 坐实 hang
 	wBad := newWatcher()
-	wBad.step(t0, snap(1000, 2), nil, stall, nil)
-	wBad.step(t0.Add(stall+time.Second), snap(1000, 2), nil, stall, func() bool { return false })
+	wBad.stepNoWarmup(t0, snap(1000, 2), nil, stall, nil)
+	wBad.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 2), nil, stall, func() bool { return false })
 	if h, _, _ := wBad.Hung(); !h {
 		t.Errorf("主动探测失败应判 hang")
 	}
@@ -200,32 +200,32 @@ func TestActiveProbe(t *testing.T) {
 	// 探测只在冻结超 grace 时触发:出词增长(健康)时不应调用
 	called := false
 	wGrow := newWatcher()
-	wGrow.step(t0, snap(1000, 2), nil, stall, nil)
-	wGrow.step(t0.Add(15*time.Second), snap(2000, 2), nil, stall, func() bool { called = true; return false })
+	wGrow.stepNoWarmup(t0, snap(1000, 2), nil, stall, nil)
+	wGrow.stepNoWarmup(t0.Add(15*time.Second), snap(2000, 2), nil, stall, func() bool { called = true; return false })
 	if called {
 		t.Errorf("出词增长(健康)不应触发主动探测")
 	}
 
 	// 缺口修复:探测开 + running==0 + 冻结超 stall + 探测失败 → 判 hang(wedged-idle,scheduler 卡死)
 	wIdleBad := newWatcher()
-	wIdleBad.step(t0, snap(1000, 0), nil, stall, nil)
-	wIdleBad.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return false })
+	wIdleBad.stepNoWarmup(t0, snap(1000, 0), nil, stall, nil)
+	wIdleBad.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return false })
 	if h, _, _ := wIdleBad.Hung(); !h {
 		t.Errorf("running==0 但冻结超 stall + 探测失败(wedged-idle)应判 hang")
 	}
 
 	// 探测开 + running==0 + 探测成功 → 健康(真空闲,不误杀)
 	wIdleOK := newWatcher()
-	wIdleOK.step(t0, snap(1000, 0), nil, stall, nil)
-	wIdleOK.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return true })
+	wIdleOK.stepNoWarmup(t0, snap(1000, 0), nil, stall, nil)
+	wIdleOK.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, func() bool { return true })
 	if h, _, _ := wIdleOK.Hung(); h {
 		t.Errorf("running==0 且探测成功(真空闲)不应判 hang")
 	}
 
 	// 被动(probe=nil)+ running==0 + 冻结超 stall → 仍判空闲(不改被动行为)
 	wPassive := newWatcher()
-	wPassive.step(t0, snap(1000, 0), nil, stall, nil)
-	wPassive.step(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, nil)
+	wPassive.stepNoWarmup(t0, snap(1000, 0), nil, stall, nil)
+	wPassive.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 0), nil, stall, nil)
 	if h, _, _ := wPassive.Hung(); h {
 		t.Errorf("被动模式 running==0 冻结应仍判空闲(分不清 wedged/空闲)")
 	}
@@ -243,13 +243,13 @@ func TestProbeFailRecheck(t *testing.T) {
 	// ① 探测失败,但复核发现 progress 已经涨了 → 不判 hang,并把停滞计时重置
 	w := newWatcher()
 	w.setRecheck(func() (float64, bool) { return 1500, true }) // 探测期间涨到 1500
-	w.step(t0, snap(1000, 1), nil, stall, failProbe)
-	w.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	w.stepNoWarmup(t0, snap(1000, 1), nil, stall, failProbe)
+	w.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
 	if h, st, r := w.Hung(); h || st != "probe-fail-but-growing" {
 		t.Errorf("探测失败但复核有进度,不应判 hang;实际 hung=%v state=%s(%s)", h, st, r)
 	}
 	// 复核成功后停滞计时应归零:紧接着再来一轮(仍是旧 tp)不该立刻判 hang
-	w.step(t0.Add(stall+2*time.Second), snap(1500, 1), nil, stall, failProbe)
+	w.stepNoWarmup(t0.Add(stall+2*time.Second), snap(1500, 1), nil, stall, failProbe)
 	if h, _, _ := w.Hung(); h {
 		t.Errorf("复核后 lastGrow 应已刷新,下一轮不该马上判 hang")
 	}
@@ -257,8 +257,8 @@ func TestProbeFailRecheck(t *testing.T) {
 	// ② 探测失败且复核仍无进度 → 判 hang(原行为)
 	w2 := newWatcher()
 	w2.setRecheck(func() (float64, bool) { return 1000, true }) // 没动
-	w2.step(t0, snap(1000, 1), nil, stall, failProbe)
-	w2.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	w2.stepNoWarmup(t0, snap(1000, 1), nil, stall, failProbe)
+	w2.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
 	if h, _, r := w2.Hung(); !h {
 		t.Errorf("探测失败且复核无进度应判 hang,实际健康(%s)", r)
 	}
@@ -266,16 +266,16 @@ func TestProbeFailRecheck(t *testing.T) {
 	// ③ 复核本身拿不到数(/metrics 也挂了)→ 不能因此放过,仍判 hang
 	w3 := newWatcher()
 	w3.setRecheck(func() (float64, bool) { return 0, false })
-	w3.step(t0, snap(1000, 1), nil, stall, failProbe)
-	w3.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	w3.stepNoWarmup(t0, snap(1000, 1), nil, stall, failProbe)
+	w3.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
 	if h, _, r := w3.Hung(); !h {
 		t.Errorf("复核取不到数时不该放过(引擎连 /metrics 都答不了更像真死),实际健康(%s)", r)
 	}
 
 	// ④ 没注册复核(nil)→ 完全走原行为
 	w4 := newWatcher()
-	w4.step(t0, snap(1000, 1), nil, stall, failProbe)
-	w4.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	w4.stepNoWarmup(t0, snap(1000, 1), nil, stall, failProbe)
+	w4.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
 	if h, _, _ := w4.Hung(); !h {
 		t.Errorf("未注册复核时应保持原行为(探测失败即判 hang)")
 	}
@@ -299,8 +299,8 @@ func TestProbeEveryStalledPoll(t *testing.T) {
 	calls := 0
 	okProbe := func() bool { calls++; return true }
 	w := newWatcher()
-	w.step(t0, snap(1000, 0), nil, stall, okProbe)                    // 建基线
-	w.step(t0.Add(5*time.Second), snap(1000, 0), nil, stall, okProbe) // 停滞 5s,远小于 stall
+	w.stepNoWarmup(t0, snap(1000, 0), nil, stall, okProbe)                    // 建基线
+	w.stepNoWarmup(t0.Add(5*time.Second), snap(1000, 0), nil, stall, okProbe) // 停滞 5s,远小于 stall
 	if calls != 1 {
 		t.Fatalf("停滞 5s(<stall)就应主动探测一次,实际调用 %d 次", calls)
 	}
@@ -313,9 +313,9 @@ func TestProbeEveryStalledPoll(t *testing.T) {
 	failProbe := func() bool { fails++; return false }
 	w2 := newWatcher()
 	w2.setRecheck(func() (float64, bool) { return 1000, true }) // 复核也没进度
-	w2.step(t0, snap(1000, 1), nil, stall, failProbe)
+	w2.stepNoWarmup(t0, snap(1000, 1), nil, stall, failProbe)
 	for i := 1; i <= 5; i++ { // 5s、10s ... 25s,都 < stall
-		w2.step(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, failProbe)
+		w2.stepNoWarmup(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, failProbe)
 		if h, st, r := w2.Hung(); h {
 			t.Fatalf("停滞 %ds(<stall)探测失败不应判 hang;实际 state=%s(%s)", i*5, st, r)
 		}
@@ -327,7 +327,7 @@ func TestProbeEveryStalledPoll(t *testing.T) {
 		t.Errorf("连续失败计数应为 5,实际 %d", w2.probeFails)
 	}
 	// 满 stall 之后才判 hang,且此时已连败多次
-	w2.step(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
+	w2.stepNoWarmup(t0.Add(stall+time.Second), snap(1000, 1), nil, stall, failProbe)
 	if h, st, _ := w2.Hung(); !h || st != "stall-hang" {
 		t.Errorf("停滞满 stall 且连续探测失败应判 hang;实际 hung=%v state=%s", h, st)
 	}
@@ -337,23 +337,23 @@ func TestProbeEveryStalledPoll(t *testing.T) {
 	w3.setRecheck(func() (float64, bool) { return 1000, true })
 	flaky := true
 	probe := func() bool { flaky = !flaky; return flaky } // 交替 成功/失败
-	w3.step(t0, snap(1000, 1), nil, stall, probe)
+	w3.stepNoWarmup(t0, snap(1000, 1), nil, stall, probe)
 	for i := 1; i <= 10; i++ {
-		w3.step(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, probe)
+		w3.stepNoWarmup(t0.Add(time.Duration(i*5)*time.Second), snap(1000, 1), nil, stall, probe)
 	}
 	if w3.probeFails > 1 {
 		t.Errorf("探测成功应把连续失败计数清零,实际 %d", w3.probeFails)
 	}
 	// 即使停滞已远超 stall,只要还能交替探通就不该判 hang
-	w3.step(t0.Add(stall+time.Minute), snap(1000, 1), nil, stall, func() bool { return true })
+	w3.stepNoWarmup(t0.Add(stall+time.Minute), snap(1000, 1), nil, stall, func() bool { return true })
 	if h, _, _ := w3.Hung(); h {
 		t.Errorf("探测存活时不应判 hang(哪怕停滞已超 stall)")
 	}
 
 	// ④ 被动模式(probe=nil)行为不变:未满 stall 走 freeze-grace
 	w4 := newWatcher()
-	w4.step(t0, snap(1000, 1), nil, stall, nil)
-	w4.step(t0.Add(5*time.Second), snap(1000, 1), nil, stall, nil)
+	w4.stepNoWarmup(t0, snap(1000, 1), nil, stall, nil)
+	w4.stepNoWarmup(t0.Add(5*time.Second), snap(1000, 1), nil, stall, nil)
 	if h, st, r := w4.Hung(); h || st != "freeze-grace" {
 		t.Errorf("被动模式未满 stall 应为 freeze-grace;实际 hung=%v state=%s(%s)", h, st, r)
 	}
@@ -374,10 +374,10 @@ func TestKVGaugeCoversPrefill(t *testing.T) {
 
 	// ① tp 不动但 KV 在涨 -> 视为在干活,停滞计时被重置,久了也不判 hang
 	w := newWatcher()
-	w.step(t0, snapKV(1000, 0.10, 1), nil, stall, nil) // 基线
-	for i := 1; i <= 20; i++ {                         // 100 秒,远超 stall=30s
+	w.stepNoWarmup(t0, snapKV(1000, 0.10, 1), nil, stall, nil) // 基线
+	for i := 1; i <= 20; i++ {                                 // 100 秒,远超 stall=30s
 		at := t0.Add(time.Duration(i*5) * time.Second)
-		w.step(at, snapKV(1000, 0.10+float64(i)*0.001, 1), nil, stall, nil)
+		w.stepNoWarmup(at, snapKV(1000, 0.10+float64(i)*0.001, 1), nil, stall, nil)
 	}
 	if hung, _, reason := w.Hung(); hung {
 		t.Fatalf("tp 平但 KV 持续上升(prefill 在分配 block)不该判 hang,实际:%s", reason)
@@ -385,8 +385,8 @@ func TestKVGaugeCoversPrefill(t *testing.T) {
 
 	// ② tp 和 KV 【同时】冻结 -> 真 hang,仍要判出来(这条腿不能把 hang 掩盖掉)
 	w2 := newWatcher()
-	w2.step(t0, snapKV(1000, 0.10, 1), nil, stall, nil)
-	w2.step(t0.Add(stall+time.Second), snapKV(1000, 0.10, 1), nil, stall, nil)
+	w2.stepNoWarmup(t0, snapKV(1000, 0.10, 1), nil, stall, nil)
+	w2.stepNoWarmup(t0.Add(stall+time.Second), snapKV(1000, 0.10, 1), nil, stall, nil)
 	if hung, _, _ := w2.Hung(); !hung {
 		t.Fatal("tp 与 KV 同时冻结且 running>0,应判 hang")
 	}
@@ -394,10 +394,10 @@ func TestKVGaugeCoversPrefill(t *testing.T) {
 	// ③ KV 【下降】不算进度 —— 引擎卡死后客户端陆续超时断开也会释放 block,
 	//    拿下降当"在干活"会把 hang 掩盖成健康。
 	w3 := newWatcher()
-	w3.step(t0, snapKV(1000, 0.90, 1), nil, stall, nil)
+	w3.stepNoWarmup(t0, snapKV(1000, 0.90, 1), nil, stall, nil)
 	for i := 1; i <= 10; i++ { // 50 秒,KV 一路下降
 		at := t0.Add(time.Duration(i*5) * time.Second)
-		w3.step(at, snapKV(1000, 0.90-float64(i)*0.01, 1), nil, stall, nil)
+		w3.stepNoWarmup(at, snapKV(1000, 0.90-float64(i)*0.01, 1), nil, stall, nil)
 	}
 	if hung, _, _ := w3.Hung(); !hung {
 		t.Fatal("tp 平 + KV 只降不升,应判 hang(下降不算进度)")
@@ -408,8 +408,8 @@ func TestKVGaugeCoversPrefill(t *testing.T) {
 	noKV := func(tp, running float64) metricsSnap {
 		return metricsSnap{tp: tp, haveTP: true, running: running}
 	}
-	w4.step(t0, noKV(1000, 1), nil, stall, nil)
-	w4.step(t0.Add(stall+time.Second), noKV(1000, 1), nil, stall, nil)
+	w4.stepNoWarmup(t0, noKV(1000, 1), nil, stall, nil)
+	w4.stepNoWarmup(t0.Add(stall+time.Second), noKV(1000, 1), nil, stall, nil)
 	if hung, _, _ := w4.Hung(); !hung {
 		t.Fatal("没有 KV gauge 时应退回原逻辑:tp 冻结 + running>0 -> hang")
 	}
@@ -446,8 +446,8 @@ func TestKVDeltaFormatting(t *testing.T) {
 		return metricsSnap{tp: tp, haveTP: true, kv: kv, haveKV: true, running: 1}
 	}
 	w := newWatcher()
-	w.step(t0, snapKV(1000, 0.010000), nil, stall, nil)
-	w.step(t0.Add(5*time.Second), snapKV(1000, 0.010861), nil, stall, nil) // 一个 chunk 的量级
+	w.stepNoWarmup(t0, snapKV(1000, 0.010000), nil, stall, nil)
+	w.stepNoWarmup(t0.Add(5*time.Second), snapKV(1000, 0.010861), nil, stall, nil) // 一个 chunk 的量级
 	_, state, reason := w.Hung()
 	if state != "kv-growing" {
 		t.Fatalf("应走 kv-growing 分支,实际 state=%s reason=%s", state, reason)
@@ -475,11 +475,11 @@ func TestLogHangBeatsKVGrowing(t *testing.T) {
 	}
 	w := newWatcher()
 	w.logEnabled, w.logStall, w.logWindow = true, 15*time.Second, 120*time.Second
-	w.step(t0, snap(1000, 0.10), nil, stall, nil) // 基线
+	w.stepNoWarmup(t0, snap(1000, 0.10), nil, stall, nil) // 基线
 
 	// 引擎刚喊过特征行,且停滞已超 logStall;同时 KV 还在涨(prefill 在分配 block)
 	w.lastLogHit = t0.Add(18 * time.Second)
-	w.step(t0.Add(20*time.Second), snap(1000, 0.20), nil, stall, nil)
+	w.stepNoWarmup(t0.Add(20*time.Second), snap(1000, 0.20), nil, stall, nil)
 
 	hung, state, reason := w.Hung()
 	if !hung || state != "stall-hang-log" {

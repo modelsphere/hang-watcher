@@ -105,10 +105,10 @@ func TestLogFastPathShortCircuitsProbe(t *testing.T) {
 
 	w := newWatcher()
 	w.enableLogConfirm(30*time.Second, 120*time.Second)
-	w.step(t0, snap(1000, 1), nil, stall, probe) // 基线
-	at := t0.Add(40 * time.Second)               // 过了 log_stall(30)但没到 stall(60)
+	w.stepNoWarmup(t0, snap(1000, 1), nil, stall, probe) // 基线
+	at := t0.Add(40 * time.Second)                       // 过了 log_stall(30)但没到 stall(60)
 	w.noteLogHits(at.Add(-5*time.Second), 1, nil)
-	w.step(at, snap(1000, 1), nil, stall, probe)
+	w.stepNoWarmup(at, snap(1000, 1), nil, stall, probe)
 
 	if h, st, r := w.Hung(); !h || st != "stall-hang-log" {
 		t.Errorf("停滞 40s + 日志特征应走快判,实际 hung=%v state=%s(%s)", h, st, r)
@@ -128,11 +128,11 @@ func TestLogConfirmHotReload(t *testing.T) {
 
 	w := newWatcher()
 	w.enableLogConfirm(120*time.Second, 120*time.Second) // 初始:log_stall=120
-	w.step(t0, snap(1000, 1), nil, stall, nil)
+	w.stepNoWarmup(t0, snap(1000, 1), nil, stall, nil)
 
 	at := t0.Add(40 * time.Second)
 	w.noteLogHits(at.Add(-5*time.Second), 1, nil)
-	w.step(at, snap(1000, 1), nil, stall, nil)
+	w.stepNoWarmup(at, snap(1000, 1), nil, stall, nil)
 	if h, _, _ := w.Hung(); h {
 		t.Fatalf("停滞 40s < log_stall 120s,不该判 hang")
 	}
@@ -141,7 +141,7 @@ func TestLogConfirmHotReload(t *testing.T) {
 	w.enableLogConfirm(30*time.Second, 120*time.Second)
 	at2 := t0.Add(45 * time.Second)
 	w.noteLogHits(at2.Add(-5*time.Second), 1, nil)
-	w.step(at2, snap(1000, 1), nil, stall, nil)
+	w.stepNoWarmup(at2, snap(1000, 1), nil, stall, nil)
 	if h, st, r := w.Hung(); !h || st != "stall-hang-log" {
 		t.Errorf("热更后 log_stall=30,停滞 45s + 日志特征应快判 hang;实际 hung=%v state=%s(%s)", h, st, r)
 	}
