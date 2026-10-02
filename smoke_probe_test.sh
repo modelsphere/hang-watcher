@@ -15,7 +15,7 @@
 #                  连败次数 > 1。
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; WORK="$(mktemp -d)"
-EPORT=18056; HPORT=19091
+EPORT=${EPORT:-18056}; HPORT=${HPORT:-19091}
 STALL=10; POLL=2; PTIMEOUT=2
 trap 'kill ${FAKE:-0} ${SC:-0} 2>/dev/null; rm -rf "$WORK"' EXIT
 
@@ -67,7 +67,7 @@ cat > "$WORK/config.json" <<JSON
 }
 JSON
 
-ENGINE_URL="http://127.0.0.1:$EPORT" LISTEN=":$HPORT" CONFIG_FILE="$WORK/config.json" \
+WARMUP_SEC=0 ENGINE_URL="http://127.0.0.1:$EPORT" LISTEN=":$HPORT" CONFIG_FILE="$WORK/config.json" \
   "$WORK/hang-watcher" > "$WORK/hw.log" 2>&1 &
 SC=$!
 sleep 3
