@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Only the Actions: the module has no dependencies (no go.sum), and the
+  # Dockerfile's base images are build args, which Dependabot cannot follow.
+  # Go and base-image upgrades are done by hand, together with the README.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

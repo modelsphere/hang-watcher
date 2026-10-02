@@ -1,0 +1,11 @@
+hang-watcher
+Copyright (c) 2026 the ModelSphere authors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The program uses only the Go standard library (BSD-3-Clause, compiled into
+the binary).
+
+Container base images
+  docker.io/library/golang (build stage only) and docker.io/library/debian
+  (runtime) — see the images' own licenses.

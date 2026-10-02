@@ -1,11 +1,29 @@
 # Changelog
 
-Notable changes, newest first. Versions up to and including 0.1.22 were released
-from the repository this project was split out of; the commit history for them
-was carried over, but the release tags were not.
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions up to and
+including 0.1.22 were released from the repository this project was split out
+of; the commit history for them was carried over, but the release tags were not.
 
-## Unreleased
+## [Unreleased]
 
+### Added
+- CI on every pull request: `gofmt`, `go vet`, `go test`, both smoke tests and
+  a docker build, plus a gate for the license text and committed credentials.
+- Dependabot for the GitHub Actions, which are pinned to commit SHAs.
+- `NOTICE`.
+
+### Removed
+- The internal GitLab pipeline (`.gitlab-ci.yml`).
+
+### Fixed
+- The smoke tests waited for a 503 that the warm-up grace period suppresses;
+  they now run with `WARMUP_SEC=0`.
+
+## [0.1.26] - 2026-09-30
+
+### Added
 - **Warm-up grace period after readiness (`warmup_sec`, default 600).** For ten
   minutes after the engine first serves `/metrics`, hang verdicts are computed
   and logged but not acted on. The first minutes are when a healthy engine is
@@ -19,12 +37,28 @@ was carried over, but the release tags were not.
   brief scrape failure, which would let a flapping engine renew it forever.
   All four verdict paths now route through one function, so the grace period
   cannot be half-applied.
-- **Fixed: the example ConfigMap's settings never applied.** Its explanatory
+
+### Fixed
+- **The example ConfigMap's settings never applied.** Its explanatory
   comments were indented into the `config.json: |` block scalar, making them part
   of the value; Go rejects anything after a top-level JSON value, so the sidecar
   logged a parse failure and fell back to its built-in defaults with every key
   ignored. This went unnoticed because those defaults match what the file says.
   The comments are now YAML comments outside the block.
+
+## [0.1.25] - 2026-09-22
+
+### Added
+- Release workflow: a version tag builds the image for linux/amd64 and
+  linux/arm64 and pushes it to Docker Hub.
+
+### Changed
+- Go module path follows the GitHub organization rename, to
+  `github.com/modelsphere/hang-watcher`.
+
+## [0.1.24] - 2026-09-18
+
+### Changed
 - Split into a standalone repository. The image name and the configuration are
   unchanged.
 - Base images in the `Dockerfile` are now public (`docker.io/library/...`) and
@@ -97,3 +131,8 @@ was carried over, but the release tags were not.
 
 - First release: the sidecar, `/healthz`, metrics-based liveness, hot-reloaded
   configuration, and deployment examples.
+
+[Unreleased]: https://github.com/modelsphere/hang-watcher/compare/0.1.26...HEAD
+[0.1.26]: https://github.com/modelsphere/hang-watcher/compare/0.1.25...0.1.26
+[0.1.25]: https://github.com/modelsphere/hang-watcher/compare/0.1.24...0.1.25
+[0.1.24]: https://github.com/modelsphere/hang-watcher/releases/tag/0.1.24
