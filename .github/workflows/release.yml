@@ -1,9 +1,7 @@
 # Public release: a version tag builds the image and pushes it to Docker Hub.
 #
-# The internal image is built separately by .gitlab-ci.yml and goes to harbor.
-# Both build the same Dockerfile; only the base-image build args and the
-# destination registry differ. Every base here already defaults to a public
-# image, so this side passes no overrides.
+# The Dockerfile's base images default to public ones, so no build args are
+# passed here.
 #
 # Tags in this repo have no `v` prefix (0.1.24), so both shapes trigger.
 #
