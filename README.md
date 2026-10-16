@@ -200,6 +200,57 @@ Two things matter:
 One sidecar and one probe cover both; LWS only adds the switch that turns a
 single-pod restart into a group recreation.
 
+## Engine identity: `GET /engine`
+
+A client that keeps state tied to one engine process -- a prefill/decode router
+holding KV-transfer sessions with its workers, for example -- needs to know when
+that process was replaced. Watching the pod does not tell it: the kubelet
+restarts the engine container in place, and the pod, its IP and its endpoints
+all stay the same. The sidecar already scrapes the engine every poll, so it
+reports which instance it is looking at, on the same port as `/healthz`:
+
+```console
+$ curl -s http://<pod-ip>:9090/engine
+{"engine_id":"pst-1791943641.29","started_at":"2026-10-14T02:07:21.29Z","source":"process_start_time"}
+```
+
+Before the engine has been identified it answers `503`, so "not known yet" can
+never be mistaken for an id.
+
+- `engine_id` changes exactly when the engine process is replaced. **Compare
+  this**, not `started_at`.
+- `started_at` is the engine's start time (UTC), as well as it can be known.
+- `source` says where both came from, and so how far each can be trusted:
+
+| `source` | taken from | `started_at` | `engine_id` survives a sidecar restart |
+|---|---|---|---|
+| `process_start_time` | `process_start_time_seconds` (vLLM) | the engine's own start time | yes |
+| `startup_fingerprint` | sglang's `startup_time_seconds` / `startup_cuda_graph_time_seconds` (sglang >= 0.5.19) | when this sidecar first saw the instance | yes |
+| `observed` | neither available; minted by the sidecar, renewed when token counters go backwards | when this sidecar first saw the instance | **no** |
+
+sglang publishes no start timestamp, only how long each startup phase took.
+Those durations are set once per process and measured to the nanosecond, so two
+processes practically never report the same set, and together they serve as a
+fingerprint -- but they cannot say *when* the process started. They also do not
+all appear at once, so new series joining is the same process; only a value
+changing, or a series disappearing, counts as a new one.
+
+With `observed`, a restarted sidecar reports a new id for the same engine, and
+an engine restarted while idle (counters at 0 before and after) goes unnoticed;
+treat it as advisory.
+
+Why not read the engine process the way `ps` does: containers in a pod have
+separate pid namespaces, so the sidecar's `/proc` holds only its own processes.
+`shareProcessNamespace` would change that, but it makes the pause container
+pid 1, and engine charts commonly rely on the engine being pid 1 of its
+container -- a preStop hook that signals pid 1 and then kills every other
+process it can see would take down the whole pod.
+
+A restart detected this way puts the watcher back into its startup state (a
+fresh baseline and warm-up grace period from the new instance's first scrape).
+Counter regression, the only signal before, misses an engine that was idle or
+whose new process outran the old count within one poll.
+
 ## Build and test
 
 ```bash
@@ -208,7 +259,7 @@ CGO_ENABLED=0 go build -o hang-watcher .
 docker build -t hang-watcher:dev .
 ```
 
-`smoke_test.sh` and `smoke_probe_test.sh` run the real binary against a fake
+`smoke_test.sh`, `smoke_probe_test.sh` and `smoke_engine_test.sh` run the real binary against a fake
 engine and assert end-to-end behaviour, including the case a unit test cannot
 reach: that a *single* probe failure does not flip `/healthz` to 503.
 

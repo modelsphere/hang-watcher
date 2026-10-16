@@ -85,6 +85,12 @@ type metricsSnap struct {
 	running float64 // 在途请求数
 	kv      float64 // KV 水位 gauge(kvGaugeMetrics 求和),prefill 期间的进度信号
 	haveKV  bool    // 是否解析到任一 KV gauge(sglang 侧没有 → false,该腿自动不生效)
+
+	// Engine instance identity, see engine.go. startTime is the unix time from
+	// process_start_time_seconds (vLLM exposes it; sglang does not), 0 if absent.
+	// startup holds sglang's startup_* gauges keyed by full series, nil if absent.
+	startTime float64
+	startup   map[string]float64
 }
 
 // parseMetrics:解析 Prometheus 文本 → token_progress + running。
@@ -109,6 +115,15 @@ func parseMetrics(text string) metricsSnap {
 		val, err := strconv.ParseFloat(fields[len(fields)-1], 64)
 		if err != nil {
 			continue
+		}
+		if name == processStartMetric {
+			s.startTime = val
+		}
+		if startupMetrics[name] {
+			if s.startup == nil {
+				s.startup = map[string]float64{}
+			}
+			s.startup[fullKey] = val
 		}
 		if progressMetrics[name] {
 			s.tp += val
@@ -171,6 +186,9 @@ type watcher struct {
 	// 每轮停滞都探,成功的探测会推进 progress 把停滞计时按回零,所以「停滞累计到 stall」
 	// 本身已经蕴含「这段时间里每次探测都失败」,不需要再拿这个计数器当门槛。
 	probeFails int
+
+	// Which engine instance is being watched, served on /engine. See engine.go.
+	eng engineState
 }
 
 // setRecheck:注册「再取一次 token_progress」的回调。主动探测失败后用它复核 ——
@@ -263,6 +281,15 @@ func (w *watcher) Hung() (bool, string, string) {
 // running>0 停滞的误杀);打不通才坐实 hang。其它分支(空闲/不可达/出词)不触发,不额外加载。
 func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall, warmup time.Duration, probe func() bool) {
 	w.warmup = warmup
+	if w.noteEngine(now, m, fetchErr == nil) {
+		// The engine was replaced. Start over as if the sidecar had just come
+		// up: a fresh baseline, and the warm-up grace period from this scrape.
+		// Counter regression below covers only some restarts: it misses an
+		// engine that was idle (counters 0 before and after) or whose new
+		// process outran the old count within one poll.
+		w.started, w.haveBaseline, w.firstFail, w.probeFails = false, false, time.Time{}, 0
+		w.set(false, "restart", "引擎实例变了("+w.eng.idSource+"),重置基线与 warmup")
+	}
 	if fetchErr != nil {
 		if !w.started {
 			w.set(false, "startup", "启动中:/metrics 暂不可达(startupProbe 兜)")
@@ -314,6 +341,7 @@ func (w *watcher) step(now time.Time, m metricsSnap, fetchErr error, stall, warm
 		// and never be declared hung. A counter reset is hard evidence of a new
 		// process; a flap is not.
 		w.set(false, "regress", "计数器倒退(引擎重启过),重置基线与 warmup")
+		w.noteRegress(now)
 		w.lastTP, w.lastGrow, w.probeFails = m.tp, now, 0
 		w.lastKV, w.haveKVBase = m.kv, m.haveKV
 		w.readyAt = now
