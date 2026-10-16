@@ -211,9 +211,12 @@ func main() {
 		}
 		_, _ = io.WriteString(rw, "ok: "+reason)
 	})
+	// /engine: which engine instance this is and when it started, for clients
+	// that must notice a restart (see engine.go).
+	mux.HandleFunc("/engine", engineHandler(w))
 	srv := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Printf("HTTP on %s (/healthz);engine=%s;config=%s", listen, engineURL, configFile)
+		log.Printf("HTTP on %s (/healthz, /engine);engine=%s;config=%s", listen, engineURL, configFile)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http: %v", err)
 		}
@@ -224,6 +227,7 @@ func main() {
 
 	client := &http.Client{}
 	var lastState string
+	var lastSource string // identity source last logged, see the /engine block below
 	hot := loadHot(configFile, defaults)
 	var lastMtime time.Time
 	if fi, err := os.Stat(configFile); err == nil {
@@ -299,9 +303,26 @@ func main() {
 		if err == nil {
 			snap = parseMetrics(text)
 		}
+		restartsBefore := w.engineRestarts()
 		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second,
 			time.Duration(hot.WarmupSec)*time.Second, makeActiveProbe(client, engineURL, hot))
 
+		if e, known := w.Engine(); known && e.Source != lastSource {
+			// Logged on change only. observed is the one worth a warning: its id
+			// changes when this sidecar restarts and misses an idle engine's
+			// restart, so a client relying on /engine should know.
+			lastSource = e.Source
+			if e.Source == idObserved {
+				log.Printf("警告:/engine 身份来源=observed(引擎 /metrics 里既无 process_start_time_seconds 也无 sglang startup_* 指标," +
+					"如 vLLM --api-server-count>1 的多进程 metrics);engine_id 在 hang-watcher 重启后会变,空闲引擎重启也看不出来")
+			} else {
+				log.Printf("/engine 身份来源=%s engine_id=%s", e.Source, e.EngineID)
+			}
+		}
+		if w.engineRestarts() != restartsBefore {
+			e, _ := w.Engine()
+			log.Printf("引擎重启:engine_id=%s started_at=%s(%s)", e.EngineID, e.StartedAt, e.Source)
+		}
 		if hung, state, reason := w.Hung(); state != lastState { // 粗状态变化才打日志(reason 内数字每轮变,按 state 去重免刷屏)
 			lastState = state
 			if hung {

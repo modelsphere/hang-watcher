@@ -9,6 +9,23 @@ of; the commit history for them was carried over, but the release tags were not.
 ## [Unreleased]
 
 ### Added
+- **`GET /engine`: which engine instance is running and when it started**, for
+  clients that share state with the engine and must notice a restart -- a
+  prefill/decode router, for one. The kubelet restarts the engine container in
+  place, keeping the pod IP, so watching pods or endpoints shows nothing.
+  Returns `{"engine_id", "started_at", "source", "restarts",
+  "watcher_started_at"}` on the `/healthz` port (`restarts` counts the engine
+  restarts this sidecar has seen since it started);
+  `503` before the engine has been identified. The identity is taken from
+  vLLM's `process_start_time_seconds` (exact start time), sglang's `startup_*`
+  gauges (a fingerprint that survives sidecar restarts; `started_at` is then
+  when the sidecar first saw the instance), or, with neither, an id minted by
+  the sidecar that does not survive its restart.
+- A restart detected this way puts the watcher back into its startup state: a
+  fresh baseline and warm-up grace period from the new instance's first
+  scrape. Counter regression, the only signal before, misses an engine that was
+  idle (counters stay 0) or whose new process outran the old count within one
+  poll.
 - CI on every pull request: `gofmt`, `go vet`, `go test`, both smoke tests and
   a docker build, plus a gate for the license text and committed credentials.
 - Dependabot for the GitHub Actions, which are pinned to commit SHAs.

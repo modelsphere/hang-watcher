@@ -37,6 +37,7 @@ jobs:
       # /healthz flip. No Kubernetes needed.
       - run: bash smoke_test.sh
       - run: bash smoke_probe_test.sh
+      - run: bash smoke_engine_test.sh
       - run: docker build -t hang-watcher:ci .
 
   gate:
