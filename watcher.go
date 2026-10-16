@@ -188,7 +188,8 @@ type watcher struct {
 	probeFails int
 
 	// Which engine instance is being watched, served on /engine. See engine.go.
-	eng engineState
+	eng    engineState
+	bornAt time.Time // when this sidecar started, reported on /engine
 }
 
 // setRecheck:注册「再取一次 token_progress」的回调。主动探测失败后用它复核 ——
@@ -220,7 +221,7 @@ func (w *watcher) noteLogHits(now time.Time, hits int, err error) {
 }
 
 func newWatcher() *watcher {
-	return &watcher{state: "startup", reason: "启动中(未取到首个 metrics)"}
+	return &watcher{state: "startup", reason: "启动中(未取到首个 metrics)", bornAt: time.Now()}
 }
 
 func (w *watcher) set(hung bool, state, reason string) {

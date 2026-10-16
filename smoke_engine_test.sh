@@ -56,16 +56,18 @@ run_case() { # $1 name, $2 first metrics, $3 restarted metrics, $4 expected sour
   sleep 2.5
   b=$(curl -s "http://127.0.0.1:$HPORT/engine"); id1=$(field "$b" engine_id)
   check "engine up: source" "$(field "$b" source)" "$4"
-  check "engine up: fields" "$(python3 -c 'import json,sys; print(",".join(sorted(json.loads(sys.argv[1]))))' "$b")" "engine_id,source,started_at"
+  check "engine up: fields" "$(python3 -c 'import json,sys; print(",".join(sorted(json.loads(sys.argv[1]))))' "$b")" "engine_id,restarts,source,started_at,watcher_started_at"
   # 3. engine restarted
   printf '%b' "$3" > "$WORK/metrics.txt"
   sleep 2.5
   b=$(curl -s "http://127.0.0.1:$HPORT/engine"); id2=$(field "$b" engine_id)
   check "engine restarted: id changed" "$([ "$id1" != "$id2" ] && echo yes || echo no)" yes
+  check "engine restarted: restarts" "$(field "$b" restarts)" 1
   # 4. sidecar restarted, engine untouched
   stop_sidecar; start_sidecar; sleep 2.5
   b=$(curl -s "http://127.0.0.1:$HPORT/engine")
   check "sidecar restarted: same id" "$(field "$b" engine_id)" "$id2"
+  check "sidecar restarted: restarts counts from 0 again" "$(field "$b" restarts)" 0
   stop_sidecar; kill $FAKE 2>/dev/null; wait $FAKE 2>/dev/null; FAKE=
 }
 

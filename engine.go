@@ -64,7 +64,7 @@ type engineState struct {
 	id        string
 	idSource  string
 	startedAt time.Time
-	restarts  int // restarts seen by this sidecar; for its log only
+	restarts  int // restarts seen by this sidecar since it started
 
 	// The startup fingerprint is kept as series -> value rather than as a hash,
 	// because the series do not all appear at once: a scrape during startup can
@@ -171,20 +171,30 @@ func observedID(now time.Time, n int) string {
 // be trusted: process_start_time is the engine's real start;
 // startup_fingerprint and observed are fallbacks, where started_at is when this
 // sidecar first saw the instance.
+//
+// restarts counts engine restarts this sidecar has seen since
+// watcher_started_at. It starts from 0 whenever the sidecar does, so it is a
+// convenience for people reading the endpoint; a client deciding whether the
+// engine was replaced should still compare engine_id.
 type engineInfo struct {
-	EngineID  string `json:"engine_id"`
-	StartedAt string `json:"started_at"`
-	Source    string `json:"source"`
+	EngineID         string `json:"engine_id"`
+	StartedAt        string `json:"started_at"`
+	Source           string `json:"source"`
+	Restarts         int    `json:"restarts"`
+	WatcherStartedAt string `json:"watcher_started_at"`
 }
 
 func (w *watcher) Engine() (engineInfo, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	e := w.eng
-	return engineInfo{EngineID: e.id, StartedAt: rfc(e.startedAt), Source: e.idSource}, e.id != ""
+	return engineInfo{
+		EngineID: e.id, StartedAt: rfc(e.startedAt), Source: e.idSource,
+		Restarts: e.restarts, WatcherStartedAt: rfc(w.bornAt),
+	}, e.id != ""
 }
 
-// engineRestarts: restarts seen by this sidecar, for its own log.
+// engineRestarts: restarts seen by this sidecar since it started.
 func (w *watcher) engineRestarts() int {
 	w.mu.RLock()
 	defer w.mu.RUnlock()

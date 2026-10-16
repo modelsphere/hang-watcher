@@ -13,7 +13,9 @@ of; the commit history for them was carried over, but the release tags were not.
   clients that share state with the engine and must notice a restart -- a
   prefill/decode router, for one. The kubelet restarts the engine container in
   place, keeping the pod IP, so watching pods or endpoints shows nothing.
-  Returns `{"engine_id", "started_at", "source"}` on the `/healthz` port;
+  Returns `{"engine_id", "started_at", "source", "restarts",
+  "watcher_started_at"}` on the `/healthz` port (`restarts` counts the engine
+  restarts this sidecar has seen since it started);
   `503` before the engine has been identified. The identity is taken from
   vLLM's `process_start_time_seconds` (exact start time), sglang's `startup_*`
   gauges (a fingerprint that survives sidecar restarts; `started_at` is then

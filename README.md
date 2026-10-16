@@ -211,7 +211,8 @@ reports which instance it is looking at, on the same port as `/healthz`:
 
 ```console
 $ curl -s http://<pod-ip>:9090/engine
-{"engine_id":"pst-1791943641.29","started_at":"2026-10-14T02:07:21.29Z","source":"process_start_time"}
+{"engine_id":"pst-1791943641.29","started_at":"2026-10-14T02:07:21.29Z","source":"process_start_time",
+ "restarts":1,"watcher_started_at":"2026-10-14T01:52:10.48Z"}
 ```
 
 Before the engine has been identified it answers `503`, so "not known yet" can
@@ -220,7 +221,12 @@ never be mistaken for an id.
 - `engine_id` changes exactly when the engine process is replaced. **Compare
   this**, not `started_at`.
 - `started_at` is the engine's start time (UTC), as well as it can be known.
-- `source` says where both came from, and so how far each can be trusted:
+- `restarts` is how many times this sidecar has seen the engine replaced since
+  `watcher_started_at`, the sidecar's own start. It starts again from 0 when the
+  sidecar restarts, so it reads well for a person; a client deciding whether
+  to act should compare `engine_id`.
+- `source` says where `engine_id` and `started_at` came from, and so how far
+  each can be trusted:
 
 | `source` | taken from | `started_at` | `engine_id` survives a sidecar restart |
 |---|---|---|---|

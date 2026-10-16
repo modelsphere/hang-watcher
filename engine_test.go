@@ -96,6 +96,9 @@ func TestEngineRestartWithoutCounterRegression(t *testing.T) {
 	if e.RestartsObserved != 1 || e.EngineID == before {
 		t.Fatalf("a new process_start_time is a restart: %+v", e)
 	}
+	if info, _ := w.Engine(); info.Restarts != 1 {
+		t.Errorf("restarts on /engine = %d, want 1", info.Restarts)
+	}
 	if e.StartedAt != "2026-10-14T03:53:33.37Z" {
 		t.Errorf("started_at should follow the new process, got %s", e.StartedAt)
 	}
@@ -215,7 +218,8 @@ func TestEngineHandler(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("body is not JSON: %v: %s", err, rec.Body.String())
 	}
-	want := map[string]any{"engine_id": "pst-1791943641.29", "started_at": "2026-10-14T02:07:21.29Z", "source": "process_start_time"}
+	want := map[string]any{"engine_id": "pst-1791943641.29", "started_at": "2026-10-14T02:07:21.29Z", "source": "process_start_time",
+		"restarts": float64(0), "watcher_started_at": rfc(w.bornAt)}
 	if rec.Code != http.StatusOK || len(got) != len(want) {
 		t.Fatalf("want 200 with exactly %v, got %d %v", want, rec.Code, got)
 	}
