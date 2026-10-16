@@ -235,3 +235,48 @@ func TestEngineHandler(t *testing.T) {
 		t.Errorf("POST: want 405, got %d", rec.Code)
 	}
 }
+
+// A scrape that lacks some startup series -- reported late, or a body cut off
+// at the read limit -- is not a restart. Control: the same scrape with one value
+// changed is, so the test cannot pass against an implementation that never
+// detects sglang restarts.
+func TestEngineSglangMissingSeriesIsNotRestart(t *testing.T) {
+	t0 := time.Now()
+	truncated := `sglang:startup_time_seconds{engine_type="unified",model_name="qwen",phase="load_weight"} 6.029548802413046
+sglang:realtime_tokens_total{mode="decode"} 0
+`
+	w := newWatcher()
+	scrape(w, t0, sglangFull)
+	id := view(w).EngineID
+	scrape(w, t0.Add(5*time.Second), truncated)
+	scrape(w, t0.Add(10*time.Second), sglangFull) // and back: still the same process
+	if e := view(w); e.EngineID != id || e.RestartsObserved != 0 {
+		t.Fatalf("missing series must not read as a restart: %+v", e)
+	}
+
+	changed := `sglang:startup_time_seconds{engine_type="unified",model_name="qwen",phase="load_weight"} 5.98812301
+sglang:realtime_tokens_total{mode="decode"} 0
+`
+	ctrl := newWatcher()
+	scrape(ctrl, t0, sglangFull)
+	scrape(ctrl, t0.Add(5*time.Second), changed)
+	if e := view(ctrl); e.RestartsObserved != 1 {
+		t.Fatalf("control: a changed value in a partial scrape is a restart, got %+v", e)
+	}
+}
+
+// Late phases join the remembered set, so a later change in one of them is
+// still caught.
+func TestEngineSglangLatePhaseChangeIsRestart(t *testing.T) {
+	t0 := time.Now()
+	w := newWatcher()
+	scrape(w, t0, sglangPartial) // only load_weight
+	scrape(w, t0.Add(5*time.Second), sglangFull)
+	late := `sglang:startup_time_seconds{engine_type="unified",model_name="qwen",phase="load_weight"} 6.029548802413046
+sglang:startup_time_seconds{engine_type="unified",model_name="qwen",phase="scheduler_e2e"} 99.5
+`
+	scrape(w, t0.Add(10*time.Second), late)
+	if e := view(w); e.RestartsObserved != 1 {
+		t.Fatalf("a phase first seen late and then changed is a restart: %+v", e)
+	}
+}

@@ -237,13 +237,19 @@ never be mistaken for an id.
 sglang publishes no start timestamp, only how long each startup phase took.
 Those durations are set once per process and measured to the nanosecond, so two
 processes practically never report the same set, and together they serve as a
-fingerprint -- but they cannot say *when* the process started. They also do not
-all appear at once, so new series joining is the same process; only a value
-changing, or a series disappearing, counts as a new one.
+fingerprint -- but they cannot say *when* the process started. A scrape need
+not carry all of them (some phases are reported late, and a body cut off at the
+read limit loses the tail), so only a series seen before with a different value
+counts as a new process; series joining or missing do not.
 
 With `observed`, a restarted sidecar reports a new id for the same engine, and
 an engine restarted while idle (counters at 0 before and after) goes unnoticed;
-treat it as advisory.
+treat it as advisory. The sidecar logs a warning when it falls back to it.
+
+**vLLM with `--api-server-count` > 1 ends up on `observed`.** vLLM then runs
+its metrics in multiprocess mode (it sets `PROMETHEUS_MULTIPROC_DIR` itself,
+and so does any deployment that sets it by hand), and that registry has no
+process collector, so `process_start_time_seconds` is not exported.
 
 Why not read the engine process the way `ps` does: containers in a pod have
 separate pid namespaces, so the sidecar's `/proc` holds only its own processes.

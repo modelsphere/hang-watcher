@@ -4,6 +4,7 @@
 #   2. engine up                   -> 200, {engine_id, started_at, source}
 #   3. engine restarted            -> new id
 #   4. sidecar restarted, same engine -> same id (what consumers rely on)
+#   and, with no identity metrics at all, source=observed plus a warning in the log
 # Run for both identity sources: vLLM process_start_time and sglang startup gauges.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; WORK="$(mktemp -d)"
@@ -79,6 +80,15 @@ run_case sglang \
   'sglang:startup_time_seconds{phase="scheduler_e2e"} 109.03901622537524\nsglang:realtime_tokens_total 0\nsglang:num_running_reqs 0\n' \
   'sglang:startup_time_seconds{phase="scheduler_e2e"} 108.71100912\nsglang:realtime_tokens_total 0\nsglang:num_running_reqs 0\n' \
   startup_fingerprint
+
+echo "== no identity metrics (observed) =="
+printf 'sglang:generation_tokens_total 1000\nsglang:num_running_reqs 0\n' > "$WORK/metrics.txt"
+python3 "$WORK/fake.py" "$EPORT" "$WORK/metrics.txt" > /dev/null 2>&1 &
+FAKE=$!
+: > "$WORK/sc.log"; start_sidecar; sleep 2.5
+check "source" "$(field "$(curl -s "http://127.0.0.1:$HPORT/engine")" source)" observed
+check "fallback warned in the log" "$(grep -c '警告:/engine 身份来源=observed' "$WORK/sc.log")" 1
+stop_sidecar; kill $FAKE 2>/dev/null; wait $FAKE 2>/dev/null; FAKE=
 
 if [ $fail = 0 ]; then echo "✅ 通过"; else echo "❌ 失败"; tail -20 "$WORK/sc.log"; fi
 exit $fail

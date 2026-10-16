@@ -227,6 +227,7 @@ func main() {
 
 	client := &http.Client{}
 	var lastState string
+	var lastSource string // identity source last logged, see the /engine block below
 	hot := loadHot(configFile, defaults)
 	var lastMtime time.Time
 	if fi, err := os.Stat(configFile); err == nil {
@@ -306,6 +307,18 @@ func main() {
 		w.step(time.Now(), snap, err, time.Duration(hot.StallSec)*time.Second,
 			time.Duration(hot.WarmupSec)*time.Second, makeActiveProbe(client, engineURL, hot))
 
+		if e, known := w.Engine(); known && e.Source != lastSource {
+			// Logged on change only. observed is the one worth a warning: its id
+			// changes when this sidecar restarts and misses an idle engine's
+			// restart, so a client relying on /engine should know.
+			lastSource = e.Source
+			if e.Source == idObserved {
+				log.Printf("警告:/engine 身份来源=observed(引擎 /metrics 里既无 process_start_time_seconds 也无 sglang startup_* 指标," +
+					"如 vLLM --api-server-count>1 的多进程 metrics);engine_id 在 hang-watcher 重启后会变,空闲引擎重启也看不出来")
+			} else {
+				log.Printf("/engine 身份来源=%s engine_id=%s", e.Source, e.EngineID)
+			}
+		}
 		if w.engineRestarts() != restartsBefore {
 			e, _ := w.Engine()
 			log.Printf("引擎重启:engine_id=%s started_at=%s(%s)", e.EngineID, e.StartedAt, e.Source)

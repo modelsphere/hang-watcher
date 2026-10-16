@@ -20,7 +20,10 @@
 //
 //  1. process_start_time_seconds (vLLM, and anything using the default
 //     Prometheus process collector) -- an exact start time, so the id is
-//     derived from it and started_at is exact.
+//     derived from it and started_at is exact. Not there when vLLM runs its
+//     metrics in multiprocess mode (PROMETHEUS_MULTIPROC_DIR, which it sets
+//     itself for --api-server-count > 1): that registry has no process
+//     collector, and the identity falls through to observed.
 //  2. sglang's startup_* gauges (startup_time_seconds,
 //     startup_cuda_graph_time_seconds, sglang >= 0.5.19). They are durations,
 //     not timestamps, but they are set once per process and measured to the
@@ -67,9 +70,10 @@ type engineState struct {
 	restarts  int // restarts seen by this sidecar since it started
 
 	// The startup fingerprint is kept as series -> value rather than as a hash,
-	// because the series do not all appear at once: a scrape during startup can
-	// see some phases and miss others. New series joining is the same process;
-	// only a series changing value, or one disappearing, is a new process.
+	// because a scrape need not carry every series: during startup some phases
+	// have not been reported yet, and a /metrics body cut off at the read limit
+	// loses whatever came last. So only a series seen before with a DIFFERENT
+	// value is a new process; series joining or missing are not.
 	startup map[string]float64
 }
 
@@ -77,7 +81,6 @@ type engineState struct {
 // the engine was replaced since the last one. The first identity ever seen is
 // not a restart, and neither is moving to a stronger source (an sglang engine
 // whose startup gauges only show up after its first scrape).
-
 func (w *watcher) noteEngine(now time.Time, m metricsSnap, metricsOK bool) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -101,13 +104,16 @@ func (w *watcher) noteEngine(now time.Time, m metricsSnap, metricsOK bool) bool 
 		return restarted
 	case len(m.startup) > 0:
 		if e.idSource == idStartup && sameProcess(e.startup, m.startup) {
-			if len(m.startup) > len(e.startup) {
-				e.startup = m.startup // more phases reported; the id stays put
+			for k, v := range m.startup {
+				e.startup[k] = v // phases reported late join the set; the id stays put
 			}
 			return false
 		}
 		restarted := e.idSource == idStartup
-		e.id, e.idSource, e.startup = "sfp-"+fingerprint(m.startup), idStartup, m.startup
+		e.id, e.idSource, e.startup = "sfp-"+fingerprint(m.startup), idStartup, map[string]float64{}
+		for k, v := range m.startup {
+			e.startup[k] = v
+		}
 		if restarted || e.startedAt.IsZero() {
 			e.startedAt = now
 		}
@@ -138,10 +144,11 @@ func (w *watcher) noteRegress(now time.Time) {
 	e.id, e.startedAt = observedID(now, e.restarts), now
 }
 
-// sameProcess: every series seen before still has the same value.
+// sameProcess: no series present in both has changed value. A series missing
+// from cur says nothing (not reported yet, or cut off) and is not a restart.
 func sameProcess(old, cur map[string]float64) bool {
-	for k, v := range old {
-		if nv, ok := cur[k]; !ok || nv != v {
+	for k, v := range cur {
+		if ov, ok := old[k]; ok && ov != v {
 			return false
 		}
 	}
