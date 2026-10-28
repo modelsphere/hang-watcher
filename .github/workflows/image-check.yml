@@ -1,0 +1,70 @@
+name: image-check
+
+# Build every image for each published platform and check that the binary inside
+# was compiled for that platform. A hardcoded GOARCH once shipped an amd64 binary
+# in the arm64 image: the emulated arm64 build succeeds, so only looking at the
+# binary catches it. Runs on pull requests; nothing is pushed.
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile*'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/image-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - images: >-
+              Dockerfile=/usr/local/bin/hang-watcher
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and check each image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGES: ${{ matrix.images }}
+        run: |
+          set -eu
+          arch=${PLATFORM#linux/}
+          case "$arch" in
+            amd64) want="X86-64" ;;
+            arm64) want="AArch64" ;;
+            *) echo "no ELF machine known for $arch" >&2; exit 1 ;;
+          esac
+          for spec in $IMAGES; do
+            file=${spec%%=*}; bin=${spec#*=}
+            echo "::group::$file ($PLATFORM) -> $bin"
+            docker buildx build --platform "$PLATFORM" --load -f "$file" -t "check:$arch" .
+            got=$(docker image inspect --format '{{.Architecture}}' "check:$arch")
+            [ "$got" = "$arch" ] || { echo "::error::$file: image architecture $got, want $arch"; exit 1; }
+            id=$(docker create --platform "$PLATFORM" "check:$arch")
+            docker cp "$id:$bin" ./bin.check
+            docker rm "$id" >/dev/null
+            machine=$(readelf -h ./bin.check | sed -n 's/^ *Machine: *//p')
+            echo "$file $bin: $machine"
+            case "$machine" in
+              *"$want"*) ;;
+              *) echo "::error::$file: $bin is built for '$machine', the $PLATFORM image needs $want"; exit 1 ;;
+            esac
+            rm -f ./bin.check
+            echo "::endgroup::"
+          done
