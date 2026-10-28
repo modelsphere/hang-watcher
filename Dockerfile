@@ -12,7 +12,12 @@ ARG GO_IMAGE=docker.io/library/golang:1.24-bookworm
 ARG RUNTIME_IMAGE=docker.io/library/debian:12-slim
 
 FROM ${GO_IMAGE} AS build
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOSUMDB=off GOTOOLCHAIN=local
+# TARGETARCH is set by buildx to the platform being built, so a multi-platform build
+# compiles each image for its own arch. It was hardcoded to amd64, which put an amd64
+# binary into the published arm64 image. A plain `docker build` leaves it empty and Go
+# then builds for the host, as before.
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GOSUMDB=off GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod ./
 COPY *.go ./
